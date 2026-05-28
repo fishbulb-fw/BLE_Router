@@ -1,0 +1,73 @@
+# Silicon Labs Project Configuration Tools: slcp, v0, Component selection file.
+project_name: LidottRouter
+label: LidottRouter
+description: |
+  A minimal project structure, that serves as a starting point for custom Bluetooth applications. The application starts advertising after boot and restarts advertising after a connection is closed.
+category: Bluetooth Examples
+filter:
+- name: Device Type
+  value: [SoC]
+- name: Project Difficulty
+  value: [Beginner]
+- name: Wireless Technology
+  value: [Bluetooth]
+package: Bluetooth
+quality: experimental
+readme:
+- {path: readme.md}
+- {path: readme.md}
+source:
+- {path: app.c}
+- {path: cli.c}
+tag: ['hardware:rf:band:2400']
+include:
+- path: .
+  file_list:
+  - {path: app.h}
+  - {path: cli.h}
+sdk: {id: simplicity_sdk, version: 2025.6.3}
+toolchain_settings: []
+component:
+- {id: EFR32BG27C320F768GJ39}
+- {id: app_assert}
+- {id: app_os_helper}
+- {id: bluetooth_feature_connection_role_central}
+- {id: bluetooth_feature_connection_role_peripheral}
+- {id: bluetooth_feature_gatt}
+- {id: bluetooth_feature_gatt_server}
+- {id: bluetooth_feature_legacy_advertiser}
+- {id: bluetooth_feature_legacy_scanner}
+- {id: bluetooth_feature_sm}
+- {id: bluetooth_feature_system}
+- {id: bluetooth_stack}
+- {id: brd4002a}
+- {id: brd4111b}
+- {id: clock_manager}
+- {id: device_init}
+- {id: freertos}
+- {id: gatt_configuration}
+- {id: gatt_service_device_information_override}
+- {id: iostream_retarget_stdio}
+- {id: mpu}
+- {id: rail_util_pti}
+- {id: sl_main}
+other_file:
+- {path: image/readme_img0.png}
+- {path: image/readme_img1.png}
+- {path: image/readme_img2.png}
+- {path: image/readme_img3.png}
+- {path: image/readme_img4.png}
+configuration:
+- {name: SL_STACK_SIZE, value: '2000'}
+- {name: configTOTAL_HEAP_SIZE, value: '5000'}
+- {name: configTIMER_TASK_STACK_DEPTH, value: '240'}
+- condition: [psa_crypto]
+  name: SL_PSA_KEY_USER_SLOT_COUNT
+  value: '0'
+ui_hints:
+  highlight:
+  - {path: config/btconf/gatt_configuration.btconf}
+  - {path: readme.md, focus: true}
+post_build:
+- {path: LidottRouter.slpb, profile: bt_common}
+

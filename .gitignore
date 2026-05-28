@@ -1,0 +1,20 @@
+# Simplicity Studio / GNU ARM build output
+GNU ARM*/
+*.o
+*.d
+*.axf
+*.out
+*.map
+*.bin
+*.hex
+*.s37
+*.gbl
+
+# IDE / project caches
+.pdm/
+*.bak
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
