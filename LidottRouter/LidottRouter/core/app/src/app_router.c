@@ -825,23 +825,12 @@ static float parse_telem_field(const char *telem, const char *key)
 
 static void parse_lvc22(logger_ctx_t *ctx, const char *json)
 {
-    // Sensor-side block (water in the channel)
-    ctx->pressure_raw    = (uint32_t)parse_float_value(json, "raw");
-    ctx->pc10_span       = parse_float_value(json, "sp");
-    ctx->pc10_zero       = parse_float_value(json, "zr");
-    ctx->detec_offset_m  = parse_float_value(json, "om");
-    ctx->detec_offset_c  = parse_float_value(json, "oc");
-    ctx->water_pressure  = parse_float_value(json, "cal");
-    ctx->pressure_pa_raw = parse_float_value(json, "Pa");
-    ctx->pressure_mm     = parse_float_value(json, "mm");
-    // Logger-side block (atmospheric, on-board PC10)
-    ctx->l_pressure_raw      = (uint32_t)parse_float_value(json, "l_raw");
-    ctx->l_pc10_span         = parse_float_value(json, "l_sp");
-    ctx->l_pc10_zero         = parse_float_value(json, "l_zr");
-    ctx->l_detec_offset_m    = parse_float_value(json, "l_om");
-    ctx->l_detec_offset_c    = parse_float_value(json, "l_oc");
-    ctx->atmo_pressure       = parse_float_value(json, "l_cal");
-    ctx->l_atmo_pressure_raw = parse_float_value(json, "l_pa");
+    ctx->pc10_span      = parse_float_value(json, "sp");
+    ctx->pc10_zero      = parse_float_value(json, "zr");
+    ctx->water_pressure = parse_float_value(json, "cal");
+    ctx->l_pc10_span    = parse_float_value(json, "l_sp");
+    ctx->l_pc10_zero    = parse_float_value(json, "l_zr");
+    ctx->atmo_pressure  = parse_float_value(json, "l_cal");
 }
 
 static void enter_calibrate_or_measure(logger_ctx_t *ctx)
@@ -982,7 +971,6 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         ctx->temperature    = parse_telem_field(telem, "Wt");
         ctx->atmo_pressure  = parse_telem_field(telem, "atm");
         ctx->water_pressure = parse_telem_field(telem, "Wpr");
-        ctx->atmo_temp      = parse_telem_field(telem, "AT");
         router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":22}", LOGGER_READ_PRESSURE_BLOCK);
         start_timeout(ctx, 10);

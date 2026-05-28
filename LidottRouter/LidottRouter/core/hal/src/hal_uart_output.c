@@ -63,35 +63,16 @@ void uart_output_result(const logger_ctx_t *ctx)
 #if UART_OUTPUT_ENABLED
     const char *id = ctx->serial[0] ? ctx->serial : "UNKNOWN";
 
-    // Sensor block (s_*)  = water pressure / depth in the channel
-    // Logger block (l_*)  = atmospheric pressure from the on-board PC10
-    // Top-level water=/atm= are kept as the primary display columns.
-    printf(">RESULT serial=%s level=%.0f velocity=%.3f flow=%.3f temp=%.1f "
-           "water=%.1f atm=%.1f mm=%.1f batt=%.2f AT=%.1f "
-           "s_raw=%lu s_pa=%.1f s_sp=%.3f s_zr=%.3f s_om=%.3f s_oc=%.3f "
-           "l_raw=%lu l_pa=%.1f l_sp=%.3f l_zr=%.3f l_om=%.3f l_oc=%.3f\r\n",
+    printf(">RESULT serial=%s flow=%.3f velocity=%.3f level=%.0f temp=%.1f "
+           "atm=%.1f water=%.1f batt=%.2f\r\n",
            id,
-           (double)ctx->level,
-           (double)ctx->velocity,
            (double)ctx->flow,
+           (double)ctx->velocity,
+           (double)ctx->level,
            (double)ctx->temperature,
-           (double)ctx->water_pressure,
            (double)ctx->atmo_pressure,
-           (double)ctx->pressure_mm,
-           (double)ctx->battery_voltage,
-           (double)ctx->atmo_temp,
-           (unsigned long)ctx->pressure_raw,
-           (double)ctx->pressure_pa_raw,
-           (double)ctx->pc10_span,
-           (double)ctx->pc10_zero,
-           (double)ctx->detec_offset_m,
-           (double)ctx->detec_offset_c,
-           (unsigned long)ctx->l_pressure_raw,
-           (double)ctx->l_atmo_pressure_raw,
-           (double)ctx->l_pc10_span,
-           (double)ctx->l_pc10_zero,
-           (double)ctx->l_detec_offset_m,
-           (double)ctx->l_detec_offset_c);
+           (double)ctx->water_pressure,
+           (double)ctx->battery_voltage);
 #else
     (void)ctx;
 #endif

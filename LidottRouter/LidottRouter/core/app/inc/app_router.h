@@ -120,22 +120,11 @@ typedef struct {
     float          atmo_pressure;        // LVC22 "l_cal" — logger calibrated atmospheric Pa
     float          water_pressure;       // LVC22 "cal" — sensor calibrated water Pa
     float          battery_voltage;
-    float          atmo_temp;
 
-    // LVC22 sensor-side pressure block (water pressure / depth in the channel)
-    uint32_t       pressure_raw;         // raw   — sensor ADC mirror
-    float          detec_offset_m;       // om
-    float          detec_offset_c;       // oc
-    float          pressure_pa_raw;      // Pa    — sensor raw water Pa
-    float          pressure_mm;          // mm    — sensor water depth
-
-    // LVC22 logger-side pressure block (on-board PC10, atmospheric)
-    uint32_t       l_pressure_raw;       // l_raw — logger averaged ADC count
+    // Logger-side PC10 calibration (atmospheric pressure reference). Read once
+    // at admission and emitted in >IDENT alongside the sensor-side pair.
     float          l_pc10_span;          // l_sp
     float          l_pc10_zero;          // l_zr
-    float          l_detec_offset_m;     // l_om  (fixed 1.0)
-    float          l_detec_offset_c;     // l_oc
-    float          l_atmo_pressure_raw;  // l_pa  — logger raw atmospheric Pa
 
     // Host-driven flow control
     uint32_t       host_atm_pa;          // atmospheric pressure supplied by host for calibrate
