@@ -62,9 +62,9 @@ In `config/sl_bluetooth_connection_config.h`:
 
 | Characteristic | UUID | Handle | Properties | Use |
 |----------------|------|--------|------------|-----|
-| BG22 Serial | `ec4a32a9-3d59-4108-8831-137f1e0a2d9a` | 21 | Write-no-response + Notify | Device config, FW version, system commands |
+| Config Serial | `ec4a32a9-3d59-4108-8831-137f1e0a2d9a` | 21 | Write-no-response + Notify | Device config, FW version, system commands |
 | Modem Serial | `e6ec348c-9b82-49d6-b7e8-7e0e2165ea34` | 25 | Write-no-response + Notify | AT command passthrough (not needed for router) |
-| PG22 Serial | `558481ea-fa94-4cbe-b00f-8ca48e7a3197` | 29 | Write-no-response + Notify | Sensor measurements, live channel values |
+| Data Serial | `558481ea-fa94-4cbe-b00f-8ca48e7a3197` | 29 | Write-no-response + Notify | Sensor measurements, live channel values |
 
 ### OB2 Packet Framing
 
@@ -84,7 +84,7 @@ You can copy `ob2packet.c/h` and `ob2packetex.c/h` from the logger project into 
 
 ### JSON Command/Response Reference
 
-**BG22 Serial** (device config channel):
+**Config Serial** (device config channel):
 
 | Command | Request JSON | Response JSON |
 |---------|-------------|---------------|
@@ -94,7 +94,7 @@ You can copy `ob2packet.c/h` and `ob2packetex.c/h` from the logger project into 
 | Force measurement + send | `{"Type":22,"Value":4}` | `{"Type":22,"Value":"Force Send"}` |
 | Check magnet | `{"Type":82}` | `{"Type":82}` |
 
-**PG22 Serial** (sensor data channel):
+**Data Serial** (sensor data channel):
 
 | Command | Request JSON | Response JSON |
 |---------|-------------|---------------|
@@ -129,8 +129,8 @@ You can copy `ob2packet.c/h` and `ob2packetex.c/h` from the logger project into 
 typedef enum {
     LOGGER_STATE_IDLE,
     LOGGER_STATE_DISCOVERING,      // GATT service discovery in progress
-    LOGGER_STATE_SUBSCRIBING_BG,   // Subscribing to BG22 notifications
-    LOGGER_STATE_SUBSCRIBING_PG,   // Subscribing to PG22 notifications
+    LOGGER_STATE_SUBSCRIBING_CONFIG,   // Subscribing to config-channel notifications
+    LOGGER_STATE_SUBSCRIBING_DATA,     // Subscribing to data-channel notifications
     LOGGER_STATE_READY,            // Subscribed, ready to send commands
     LOGGER_STATE_GET_SERIAL,       // Waiting for serial number response
     LOGGER_STATE_GET_FW_VERSION,   // Waiting for FW version response
@@ -151,10 +151,10 @@ typedef struct {
 
     // GATT handles (discovered at runtime, do NOT hardcode)
     uint32_t service_handle;
-    uint16_t bg22_char_handle;
-    uint16_t bg22_cccd_handle;
-    uint16_t pg22_char_handle;
-    uint16_t pg22_cccd_handle;
+    uint16_t config_char_handle;
+    uint16_t config_cccd_handle;
+    uint16_t data_char_handle;
+    uint16_t data_cccd_handle;
 
     // OB2 receive buffer for reassembly
     uint8_t  rx_buf[256];
@@ -225,7 +225,7 @@ On `sl_bt_evt_gatt_procedure_completed_id` (after service discovery):
 1. Discover characteristics: `sl_bt_gatt_discover_characteristics(connection, service_handle)`
 
 On `sl_bt_evt_gatt_characteristic_id`:
-- Match UUIDs to store `bg22_char_handle` and `pg22_char_handle`
+- Match UUIDs to store `config_char_handle` and `data_char_handle`
 
 On `sl_bt_evt_gatt_procedure_completed_id` (after char discovery):
 1. Discover descriptors for each characteristic to find CCCDs
@@ -235,10 +235,10 @@ On `sl_bt_evt_gatt_procedure_completed_id` (after char discovery):
 
 After GATT discovery completes:
 
-1. Set state = `LOGGER_STATE_SUBSCRIBING_BG`
-2. `sl_bt_gatt_set_characteristic_notification(connection, bg22_char_handle, sl_bt_gatt_notification)`
-3. On procedure complete: set state = `LOGGER_STATE_SUBSCRIBING_PG`
-4. `sl_bt_gatt_set_characteristic_notification(connection, pg22_char_handle, sl_bt_gatt_notification)`
+1. Set state = `LOGGER_STATE_SUBSCRIBING_CONFIG`
+2. `sl_bt_gatt_set_characteristic_notification(connection, config_char_handle, sl_bt_gatt_notification)`
+3. On procedure complete: set state = `LOGGER_STATE_SUBSCRIBING_DATA`
+4. `sl_bt_gatt_set_characteristic_notification(connection, data_char_handle, sl_bt_gatt_notification)`
 5. On procedure complete: set state = `LOGGER_STATE_READY`
 
 ### Step 5: Identify the Logger
@@ -247,20 +247,20 @@ Once subscribed (state = `LOGGER_STATE_READY`):
 
 1. Check known device registry by BLE address
 2. If unknown:
-   - Send `{"Type":9,"Dir":"get"}` (OB2-wrapped) to **PG22** characteristic to get serial
+   - Send `{"Type":9,"Dir":"get"}` (OB2-wrapped) to **data** characteristic to get serial
    - Set state = `LOGGER_STATE_GET_SERIAL`
    - On notification response: parse serial from `{"Type":9,"Value":"..."}`, store in registry
    - Output to UART: `[NEW DEVICE] MSFM4 <serial> (XX:XX:XX:XX:XX:XX)`
 3. If known:
    - Output: `[RECONNECT] MSFM4 <serial> (XX:XX:XX:XX:XX:XX)`
-4. Send `{"Type":10}` to **BG22** to get FW version (optional, useful for logging)
+4. Send `{"Type":10}` to **config** to get FW version (optional, useful for logging)
 
 ### Step 6: Trigger Measurement
 
 After identification:
 
 1. Set state = `LOGGER_STATE_TRIGGER_MEASURE`
-2. Send `{"Type":22,"Value":4}` (OB2-wrapped) to **BG22** characteristic
+2. Send `{"Type":22,"Value":4}` (OB2-wrapped) to **config** characteristic
 3. Wait for notification: `{"Type":22,"Value":"Force Send"}`
 4. Set state = `LOGGER_STATE_WAIT_MEASURE`
 5. Wait a fixed delay (e.g. 5-10 seconds) for the PG processor to complete its Modbus sensor read cycle. The logger's Modbus timeout is 1000 ms per query, and it polls multiple sensors sequentially.
@@ -270,7 +270,7 @@ After identification:
 After measurement delay:
 
 1. Set state = `LOGGER_STATE_GET_RESULTS`
-2. Send live channel queries to **PG22** one at a time, waiting for each response before sending the next:
+2. Send live channel queries to **data** one at a time, waiting for each response before sending the next:
 
 ```
 Send: {"LVC":0}   →  Response: {"LVC":0,"Value":<depth>}
@@ -281,7 +281,7 @@ Send: {"LVC":4}   →  Response: {"LVC":4,"Value":<...>}
 Send: {"LVC":5}   →  Response: {"LVC":5,"Value":<...>}
 ```
 
-3. Read battery: Send `{"Battery":"Test","Query":"Voltage"}` to **PG22**
+3. Read battery: Send `{"Battery":"Test","Query":"Voltage"}` to **data**
 4. Store all values in the `logger_ctx_t`
 
 ### Step 8: Output to UART
@@ -317,7 +317,7 @@ The scanner is always running. When the same or different logger advertises agai
 On `sl_bt_evt_gatt_characteristic_value_id`:
 
 1. Find logger slot by `connection_handle`
-2. Identify characteristic by `characteristic` handle (bg22 or pg22)
+2. Identify characteristic by `characteristic` handle (config or data)
 3. Append `value.data` to `logger.rx_buf`
 4. Check if a complete OB2 packet has been received:
    - Byte 0 = 0x02 (sentinel)
@@ -368,7 +368,7 @@ SCAN (always running)
 CONNECT ──► DISCOVERING (GATT service + characteristics)
                │
                ▼
-           SUBSCRIBING_BG ──► SUBSCRIBING_PG
+           SUBSCRIBING_CONFIG ──► SUBSCRIBING_DATA
                │                    │
                ▼                    ▼
            READY ◄─────────────────┘
@@ -382,13 +382,13 @@ CONNECT ──► DISCOVERING (GATT service + characteristics)
            GET_FW_VERSION (optional)
                │
                ▼
-           TRIGGER_MEASURE ──► send {"Type":22,"Value":4} to BG22
+           TRIGGER_MEASURE ──► send {"Type":22,"Value":4} to config char
                │
                ▼
            WAIT_MEASURE ──► delay 5-10s for sensor cycle
                │
                ▼
-           GET_RESULTS ──► LVC 0..5 + Battery to PG22 (sequential)
+           GET_RESULTS ──► LVC 0..5 + Battery to data char (sequential)
                │
                ▼
            DONE ──► format + output to UART

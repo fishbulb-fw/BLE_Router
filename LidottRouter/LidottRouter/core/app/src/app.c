@@ -21,14 +21,14 @@
 #include <string.h>
 #include <stdio.h>
 
-// BG22 Serial char UUID: ec4a32a9-3d59-4108-8831-137f1e0a2d9a (little-endian)
-static const uint8_t bg22_char_uuid[16] = {
+// Config Serial char UUID: ec4a32a9-3d59-4108-8831-137f1e0a2d9a (little-endian)
+static const uint8_t config_char_uuid[16] = {
     0x9a, 0x2d, 0x0a, 0x1e, 0x7f, 0x13, 0x31, 0x88,
     0x08, 0x41, 0x59, 0x3d, 0xa9, 0x32, 0x4a, 0xec
 };
 
-// PG22 Serial char UUID: 558481ea-fa94-4cbe-b00f-8ca48e7a3197 (little-endian)
-static const uint8_t pg22_char_uuid[16] = {
+// Data Serial char UUID: 558481ea-fa94-4cbe-b00f-8ca48e7a3197 (little-endian)
+static const uint8_t data_char_uuid[16] = {
     0x97, 0x31, 0x7a, 0x8e, 0xa4, 0x8c, 0x0f, 0xb0,
     0xbe, 0x4c, 0x94, 0xfa, 0xea, 0x81, 0x84, 0x55
 };
@@ -227,10 +227,10 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 
         sl_bt_evt_gatt_characteristic_t *chr = &evt->data.evt_gatt_characteristic;
         if (chr->uuid.len == 16) {
-            if (memcmp(chr->uuid.data, bg22_char_uuid, 16) == 0) {
-                ctx->bg22_char_handle = chr->characteristic;
-            } else if (memcmp(chr->uuid.data, pg22_char_uuid, 16) == 0) {
-                ctx->pg22_char_handle = chr->characteristic;
+            if (memcmp(chr->uuid.data, config_char_uuid, 16) == 0) {
+                ctx->config_char_handle = chr->characteristic;
+            } else if (memcmp(chr->uuid.data, data_char_uuid, 16) == 0) {
+                ctx->data_char_handle = chr->characteristic;
             }
         }
         break;

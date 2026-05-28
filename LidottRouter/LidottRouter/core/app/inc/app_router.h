@@ -22,7 +22,7 @@
 #define COOLDOWN_SECONDS 10
 
 // FUOTA chunk payload limits from ble-firmware-update-protocol.md.
-// Logger (BG22) chunks allow 248 bytes of GBL data; sensor chunks allow 238
+// Logger chunks allow 248 bytes of GBL data; sensor chunks allow 238
 // bytes (internal IPC layer caps payload at 240 bytes minus the 2-byte seq).
 #define FUOTA_LOGGER_CHUNK_MAX   248
 #define FUOTA_SENSOR_CHUNK_MAX   238
@@ -34,8 +34,8 @@ typedef enum {
     LOGGER_WAIT_MTU,
     LOGGER_DISCOVER_SERVICE,
     LOGGER_DISCOVER_CHARS,
-    LOGGER_SUBSCRIBE_BG22,
-    LOGGER_SUBSCRIBE_PG22,
+    LOGGER_SUBSCRIBE_CONFIG,
+    LOGGER_SUBSCRIBE_DATA,
     LOGGER_WRITE_PENDING,
     LOGGER_GET_SERIAL,
     LOGGER_GET_FW_VERSION,
@@ -100,8 +100,8 @@ typedef struct {
 
     // GATT handles (discovered at runtime)
     uint32_t       service_handle;
-    uint16_t       bg22_char_handle;
-    uint16_t       pg22_char_handle;
+    uint16_t       config_char_handle;
+    uint16_t       data_char_handle;
 
     // OB2 RX reassembly buffer
     uint8_t        rx_buf[RX_BUF_SIZE];
@@ -150,7 +150,7 @@ typedef struct {
 
     // FUOTA session state (used when mode != LOGGER_MODE_MEASURE)
     logger_mode_t  mode;
-    uint16_t       fuota_char_handle;    // bg22 or pg22 char handle
+    uint16_t       fuota_char_handle;    // config (logger) or data (sensor) char handle
     uint16_t       att_mtu;              // negotiated ATT MTU, 0 = not yet exchanged
     uint8_t        fuota_chunk_type;     // OB2 TYPE byte for chunks (0x02 or 0x03)
     uint8_t        fuota_max_payload;    // capped by MTU-3-OB2_overhead at session start

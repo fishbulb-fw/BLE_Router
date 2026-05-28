@@ -550,8 +550,8 @@ static bool regop_device_ready(const char *cmd, const char *serial,
     if (ctx->state == LOGGER_CONNECTING
      || ctx->state == LOGGER_DISCOVER_SERVICE
      || ctx->state == LOGGER_DISCOVER_CHARS
-     || ctx->state == LOGGER_SUBSCRIBE_BG22
-     || ctx->state == LOGGER_SUBSCRIBE_PG22
+     || ctx->state == LOGGER_SUBSCRIBE_CONFIG
+     || ctx->state == LOGGER_SUBSCRIBE_DATA
      || ctx->state == LOGGER_DISCONNECTING) {
         uart_output_err(cmd, serial, "device not connected");
         return false;
@@ -741,24 +741,24 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
         break;
 
     case LOGGER_DISCOVER_CHARS:
-        if (ctx->bg22_char_handle == 0 || ctx->pg22_char_handle == 0) {
+        if (ctx->config_char_handle == 0 || ctx->data_char_handle == 0) {
             disconnect_with_error(ctx, "Characteristics not found");
             return;
         }
-        ctx->state = LOGGER_SUBSCRIBE_BG22;
+        ctx->state = LOGGER_SUBSCRIBE_CONFIG;
         sl_bt_gatt_set_characteristic_notification(
-            ctx->connection_handle, ctx->bg22_char_handle,
+            ctx->connection_handle, ctx->config_char_handle,
             sl_bt_gatt_notification);
         break;
 
-    case LOGGER_SUBSCRIBE_BG22:
-        ctx->state = LOGGER_SUBSCRIBE_PG22;
+    case LOGGER_SUBSCRIBE_CONFIG:
+        ctx->state = LOGGER_SUBSCRIBE_DATA;
         sl_bt_gatt_set_characteristic_notification(
-            ctx->connection_handle, ctx->pg22_char_handle,
+            ctx->connection_handle, ctx->data_char_handle,
             sl_bt_gatt_notification);
         break;
 
-    case LOGGER_SUBSCRIBE_PG22:
+    case LOGGER_SUBSCRIBE_DATA:
         cancel_timeout(ctx);
         if (ctx->mode == LOGGER_MODE_FUOTA_LOGGER
             || ctx->mode == LOGGER_MODE_FUOTA_SENSOR) {
@@ -766,14 +766,14 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
             // kick off the BLE Start JSON.
             ctx->fuota_char_handle =
                 (ctx->mode == LOGGER_MODE_FUOTA_LOGGER)
-                    ? ctx->bg22_char_handle
-                    : ctx->pg22_char_handle;
+                    ? ctx->config_char_handle
+                    : ctx->data_char_handle;
             fuota_send_start(ctx);
             break;
         }
         // Serial was provided via the advert + admit flow, so skip the
         // Type:9 read and go straight into FW version readback.
-        router_send_command(ctx, ctx->bg22_char_handle,
+        router_send_command(ctx, ctx->config_char_handle,
                             "{\"Type\":10}", LOGGER_GET_FW_VERSION);
         start_timeout(ctx, 60);
         break;
@@ -851,11 +851,11 @@ static void enter_calibrate_or_measure(logger_ctx_t *ctx)
         snprintf(cal_cmd, sizeof(cal_cmd),
                  "{\"LVC\":15,\"Value\":%lu}", (unsigned long)ctx->host_atm_pa);
         ctx->calibrate_requested = false;
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             cal_cmd, LOGGER_CALIBRATE);
         start_timeout(ctx, 30);
     } else {
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":21}", LOGGER_TRIGGER_MEASURE);
         start_timeout(ctx, 30);
     }
@@ -916,14 +916,14 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
     switch (ctx->state) {
     case LOGGER_GET_FW_VERSION:
         parse_string_value(json, "Value", ctx->fw_version, FW_VERSION_MAX);
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"Type\":17,\"Dir\":\"get\"}", LOGGER_GET_SNS_FW);
         start_timeout(ctx, 60);
         break;
 
     case LOGGER_GET_SNS_FW:
         parse_string_value(json, "Value", ctx->sns_fw_version, SNS_FW_MAX);
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"Type\":74,\"Dir\":\"get\"}", LOGGER_GET_PC10_ZERO);
         start_timeout(ctx, 60);
         break;
@@ -932,7 +932,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         // Type:74/75 are the LOGGER's PC10 zero/span (on-board, atmospheric).
         // Sensor-side zero/span are filled in by the LVC:22 prime below.
         ctx->l_pc10_zero = parse_float_value(json, "Value") / 100.0f;
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"Type\":75,\"Dir\":\"get\"}", LOGGER_GET_PC10_SPAN);
         start_timeout(ctx, 60);
         break;
@@ -941,7 +941,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         ctx->l_pc10_span = parse_float_value(json, "Value") / 100.0f;
         // Defer >IDENT until after LVC:22 so we can publish both
         // sensor (s_*) and logger (l_*) zero/span pairs in one line.
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":22}", LOGGER_PRIME_PRESSURE);
         start_timeout(ctx, 10);
         break;
@@ -983,7 +983,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         ctx->atmo_pressure  = parse_telem_field(telem, "atm");
         ctx->water_pressure = parse_telem_field(telem, "Wpr");
         ctx->atmo_temp      = parse_telem_field(telem, "AT");
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":22}", LOGGER_READ_PRESSURE_BLOCK);
         start_timeout(ctx, 10);
         break;
@@ -996,7 +996,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             break;
         }
         parse_lvc22(ctx, json);
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":0}", LOGGER_READ_BATTERY);
         start_timeout(ctx, 10);
         break;
@@ -1093,7 +1093,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         }
         uart_output_fuota_rebooting(ctx->serial);
         if (ctx->mode == LOGGER_MODE_FUOTA_LOGGER) {
-            // Logger-mode reboot: BG22 will reboot into its own bootloader
+            // Logger-mode reboot: the logger will reboot into its own bootloader
             // immediately. Disconnect and we're done.
             cancel_timeout(ctx);
             ctx->state = LOGGER_DISCONNECTING;
@@ -1112,7 +1112,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         // Verify shape: {"BTL":"Reg","Rsp":"Read","Grp":"<grp>",...}
         if (!strstr(json, "\"BTL\":\"Reg\"")
          || !strstr(json, "\"Rsp\":\"Read\"")) {
-            // Stray frame on the PG22 link — re-arm and wait.
+            // Stray frame on the data channel — re-arm and wait.
             start_timeout_ms(ctx, 500);
             break;
         }
@@ -1234,7 +1234,7 @@ void router_on_timer_expired(logger_ctx_t *ctx)
         if (try_dispatch_regop(ctx)) {
             return;
         }
-        router_send_command(ctx, ctx->pg22_char_handle,
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":21}", LOGGER_TRIGGER_MEASURE);
         start_timeout(ctx, 30);
         return;
@@ -1503,9 +1503,9 @@ static const char *regop_cmd_name(regop_kind_t k)
     }
 }
 
-// Reg-op JSON traffic goes on the BG22 Serial characteristic (ec4a32a9-...).
-// PG22 Serial just forwards bytes via ipc_print on the single-MCU FG28 system
-// and never reaches the logger's BTL dispatcher — see logger app.c:678-727.
+// Reg-op JSON traffic goes on the config characteristic (ec4a32a9-...).
+// The data characteristic just forwards bytes via ipc_print on the single-MCU
+// logger and never reaches the BTL dispatcher — see logger app.c:678-727.
 // FUOTA-logger already uses this characteristic, so the path is proven.
 static void send_regop_read(logger_ctx_t *ctx, const char *grp,
                             logger_state_t next)
@@ -1513,7 +1513,7 @@ static void send_regop_read(logger_ctx_t *ctx, const char *grp,
     char json[64];
     snprintf(json, sizeof(json),
              "{\"BTL\":\"Reg\",\"Req\":\"Read\",\"Grp\":\"%s\"}", grp);
-    router_send_command(ctx, ctx->bg22_char_handle, json, next);
+    router_send_command(ctx, ctx->config_char_handle, json, next);
     start_timeout_ms(ctx, 500);
 }
 
@@ -1524,13 +1524,13 @@ static void send_regop_write(logger_ctx_t *ctx)
              "{\"BTL\":\"Reg\",\"Req\":\"Write\","
              "\"Grp\":\"%s\",\"Key\":\"%s\",\"Val\":\"%s\"}",
              ctx->regop_group, ctx->regop_key, ctx->regop_hex);
-    router_send_command(ctx, ctx->bg22_char_handle, json, LOGGER_REGOP_WRITE);
+    router_send_command(ctx, ctx->config_char_handle, json, LOGGER_REGOP_WRITE);
     start_timeout_ms(ctx, 500);
 }
 
 static void send_regop_commit(logger_ctx_t *ctx)
 {
-    router_send_command(ctx, ctx->bg22_char_handle,
+    router_send_command(ctx, ctx->config_char_handle,
                         "{\"BTL\":\"Reg\",\"Req\":\"Commit\"}",
                         LOGGER_REGOP_COMMIT);
     start_timeout_ms(ctx, 500);
@@ -1538,7 +1538,7 @@ static void send_regop_commit(logger_ctx_t *ctx)
 
 static void send_regop_default(logger_ctx_t *ctx)
 {
-    router_send_command(ctx, ctx->bg22_char_handle,
+    router_send_command(ctx, ctx->config_char_handle,
                         "{\"BTL\":\"Reg\",\"Req\":\"Default\"}",
                         LOGGER_REGOP_DEFAULT);
     start_timeout_ms(ctx, 500);
