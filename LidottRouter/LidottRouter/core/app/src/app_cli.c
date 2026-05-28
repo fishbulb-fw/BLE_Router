@@ -1,7 +1,12 @@
-#include "cli.h"
-#include "router.h"
-#include "uart_output.h"
-#include "ob2packet.h"
+/********************
+* Layer: APP
+* File:  app_cli.c
+* Desc:  UART command-line interface for host control
+*/
+#include "app_cli.h"
+#include "app_router.h"
+#include "hal_uart_output.h"
+#include "drvr_ob2packet.h"
 #include "sl_bt_api.h"
 #include "sl_iostream.h"
 #include "sl_iostream_handles.h"

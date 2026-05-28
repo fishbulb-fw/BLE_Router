@@ -17,14 +17,29 @@ readme:
 - {path: readme.md}
 - {path: readme.md}
 source:
-- {path: app.c}
-- {path: cli.c}
+- {path: main.c}
+- {path: core/app/src/app.c}
+- {path: core/app/src/app_freertos.c}
+- {path: core/app/src/app_router.c}
+- {path: core/app/src/app_cli.c}
+- {path: core/app/src/app_logger_registry.c}
+- {path: core/app/src/sl_gatt_service_device_information_override.c}
+- {path: core/drvr/src/drvr_ob2packet.c}
+- {path: core/hal/src/hal_uart_output.c}
 tag: ['hardware:rf:band:2400']
 include:
-- path: .
+- path: core/app/inc
   file_list:
   - {path: app.h}
-  - {path: cli.h}
+  - {path: app_router.h}
+  - {path: app_cli.h}
+  - {path: app_logger_registry.h}
+- path: core/drvr/inc
+  file_list:
+  - {path: drvr_ob2packet.h}
+- path: core/hal/inc
+  file_list:
+  - {path: hal_uart_output.h}
 sdk: {id: simplicity_sdk, version: 2025.6.3}
 toolchain_settings: []
 component:

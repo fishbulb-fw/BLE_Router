@@ -1,4 +1,9 @@
-#include "logger_registry.h"
+/********************
+* Layer: APP
+* File:  app_logger_registry.c
+* Desc:  Known device tracking (address to serial mapping)
+*/
+#include "app_logger_registry.h"
 #include <string.h>
 
 typedef struct {

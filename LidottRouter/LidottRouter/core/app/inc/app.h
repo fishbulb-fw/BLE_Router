@@ -1,3 +1,8 @@
+/********************
+* Layer: APP
+* File:  app.h
+* Desc:  Application interface
+*/
 /***************************************************************************//**
  * @file
  * @brief Application interface.

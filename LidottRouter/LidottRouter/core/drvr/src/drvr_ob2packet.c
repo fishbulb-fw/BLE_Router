@@ -1,4 +1,9 @@
-#include "ob2packet.h"
+/********************
+* Layer: DRVR
+* File:  drvr_ob2packet.c
+* Desc:  OB2 packet framing and CRC driver
+*/
+#include "drvr_ob2packet.h"
 
 uint16_t ob2packet_calculateCRC(const uint8_t * buffer, uint8_t bufferSize) {
 	uint16_t temp, flag;

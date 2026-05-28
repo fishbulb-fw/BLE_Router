@@ -57,6 +57,9 @@
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/config/btconf}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/autogen}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/app/inc}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/drvr/inc}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/hal/inc}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/platform/Device/SiliconLabs/EFR32BG27/Include}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/app/common/util/app_assert}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/platform/common/inc}&quot;"/>
@@ -189,6 +192,9 @@
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/config/btconf}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/autogen}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/app/inc}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/drvr/inc}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/core/hal/inc}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/platform/Device/SiliconLabs/EFR32BG27/Include}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/app/common/util/app_assert}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/simplicity_sdk_2025.6.3/platform/common/inc}&quot;"/>

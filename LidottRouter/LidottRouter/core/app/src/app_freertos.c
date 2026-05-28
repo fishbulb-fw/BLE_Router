@@ -1,3 +1,8 @@
+/********************
+* Layer: APP
+* File:  app_freertos.c
+* Desc:  FreeRTOS initialisation hook for the application
+*/
 /***************************************************************************//**
  * @file
  * @brief FreeRTOS helper functions for the application task.

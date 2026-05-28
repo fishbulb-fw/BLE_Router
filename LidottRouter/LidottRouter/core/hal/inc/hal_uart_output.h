@@ -1,8 +1,13 @@
-#ifndef UART_OUTPUT_H
-#define UART_OUTPUT_H
+/********************
+* Layer: HAL
+* File:  hal_uart_output.h
+* Desc:  UART output abstraction over iostream
+*/
+#ifndef HAL_UART_OUTPUT_H
+#define HAL_UART_OUTPUT_H
 
 #include <stdbool.h>
-#include "router.h"
+#include "app_router.h"
 
 void uart_output_init(void);
 void uart_output_log(const char *fmt, ...);

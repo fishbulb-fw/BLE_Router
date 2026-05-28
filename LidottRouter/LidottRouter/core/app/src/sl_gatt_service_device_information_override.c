@@ -1,3 +1,8 @@
+/********************
+* Layer: APP
+* File:  sl_gatt_service_device_information_override.c
+* Desc:  GATT device information service override
+*/
 /***************************************************************************//**
  * @file
  * @brief Device Information GATT Service Override

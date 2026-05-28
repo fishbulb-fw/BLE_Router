@@ -1,11 +1,16 @@
-#ifndef ROUTER_H
-#define ROUTER_H
+/********************
+* Layer: APP
+* File:  app_router.h
+* Desc:  Per-logger state machine and command sequencing
+*/
+#ifndef APP_ROUTER_H
+#define APP_ROUTER_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include "sl_bt_api.h"
-#include "logger_registry.h"
-#include "ob2packet.h"
+#include "app_logger_registry.h"
+#include "drvr_ob2packet.h"
 
 #define MAX_LOGGERS      8
 #define MAX_PENDING      16

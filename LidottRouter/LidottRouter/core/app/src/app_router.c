@@ -1,7 +1,12 @@
-#include "router.h"
-#include "logger_registry.h"
-#include "uart_output.h"
-#include "ob2packet.h"
+/********************
+* Layer: APP
+* File:  app_router.c
+* Desc:  Per-logger state machine and command sequencing
+*/
+#include "app_router.h"
+#include "app_logger_registry.h"
+#include "hal_uart_output.h"
+#include "drvr_ob2packet.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>

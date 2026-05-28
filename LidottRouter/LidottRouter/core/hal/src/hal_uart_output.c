@@ -1,4 +1,9 @@
-#include "uart_output.h"
+/********************
+* Layer: HAL
+* File:  hal_uart_output.c
+* Desc:  UART output abstraction over iostream
+*/
+#include "hal_uart_output.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include "FreeRTOS.h"

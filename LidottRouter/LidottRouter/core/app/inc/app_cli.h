@@ -1,5 +1,10 @@
-#ifndef CLI_H
-#define CLI_H
+/********************
+* Layer: APP
+* File:  app_cli.h
+* Desc:  UART command-line interface for host control
+*/
+#ifndef APP_CLI_H
+#define APP_CLI_H
 
 #include <stdint.h>
 

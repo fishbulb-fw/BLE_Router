@@ -1,5 +1,10 @@
-#ifndef LOGGER_REGISTRY_H
-#define LOGGER_REGISTRY_H
+/********************
+* Layer: APP
+* File:  app_logger_registry.h
+* Desc:  Known device tracking (address to serial mapping)
+*/
+#ifndef APP_LOGGER_REGISTRY_H
+#define APP_LOGGER_REGISTRY_H
 
 #include <stdint.h>
 #include <stdbool.h>

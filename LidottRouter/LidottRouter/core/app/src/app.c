@@ -1,3 +1,8 @@
+/********************
+* Layer: APP
+* File:  app.c
+* Desc:  BLE central application, scanner, and event dispatch
+*/
 /***************************************************************************//**
  * @file
  * @brief BLE Central Router — host-gated scanner, connects to MSFM4 loggers
@@ -8,11 +13,11 @@
 #include "sl_main_init.h"
 #include "app_assert.h"
 #include "app.h"
-#include "router.h"
-#include "logger_registry.h"
-#include "uart_output.h"
-#include "ob2packet.h"
-#include "cli.h"
+#include "app_router.h"
+#include "app_logger_registry.h"
+#include "hal_uart_output.h"
+#include "drvr_ob2packet.h"
+#include "app_cli.h"
 #include <string.h>
 #include <stdio.h>
 

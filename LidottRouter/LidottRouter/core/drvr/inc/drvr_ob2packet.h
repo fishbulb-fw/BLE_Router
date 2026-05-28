@@ -1,5 +1,10 @@
-#ifndef OB2PACKET_H
-#define OB2PACKET_H
+/********************
+* Layer: DRVR
+* File:  drvr_ob2packet.h
+* Desc:  OB2 packet framing and CRC driver
+*/
+#ifndef DRVR_OB2PACKET_H
+#define DRVR_OB2PACKET_H
 
 #include <stddef.h>
 #include <stdint.h>
