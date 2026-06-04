@@ -1,10 +1,12 @@
 /********************
 * Layer: APP
 * File:  app_cli.c
-* Desc:  UART command-line interface for host control
+* Desc:  UART command-line interface for host control. Verbs and `reason=`
+*        strings are the contract — see docs/uart-wire-protocol.md.
 */
 #include "app_cli.h"
 #include "app_router.h"
+#include "app_reasons.h"
 #include "hal_uart_output.h"
 #include "drvr_ob2packet.h"
 #include "sl_bt_api.h"
@@ -28,20 +30,24 @@ typedef enum {
     CLI_CMD_INVALID = 0,
     CLI_CMD_START,
     CLI_CMD_STOP,
+    CLI_CMD_CONNECT,
+    CLI_CMD_DISCONNECT,
+    CLI_CMD_MEASURE_START,
+    CLI_CMD_MEASURE_STOP,
     CLI_CMD_CALIBRATE,
-    CLI_CMD_MEASURE,
+    CLI_CMD_WIPEMODBUS,
     CLI_CMD_IGNORE,
     CLI_CMD_FUOTA,
     CLI_CMD_READREGS,
     CLI_CMD_WRITEREG,
     CLI_CMD_COMMITREGS,
     CLI_CMD_DEFAULTREGS,
-    CLI_CMD_UNKNOWN,     // first token didn't match any command
-    CLI_CMD_BAD_ATM,     // CALIBRATE with malformed pressure
-    CLI_CMD_BAD_TARGET,  // FUOTA with unknown target
-    CLI_CMD_BAD_SIZE,    // FUOTA with malformed size
-    CLI_CMD_MISSING_ARG, // required argument was absent
-    CLI_CMD_BAD_ARGS,    // WRITEREG with malformed hex value
+    CLI_CMD_UNKNOWN,
+    CLI_CMD_BAD_ATM,
+    CLI_CMD_BAD_TARGET,
+    CLI_CMD_BAD_SIZE,
+    CLI_CMD_MISSING_ARG,
+    CLI_CMD_BAD_ARGS,
 } cli_cmd_type_t;
 
 #define REGOP_GROUP_MAX  16
@@ -51,7 +57,7 @@ typedef enum {
 typedef struct {
     cli_cmd_type_t type;
     char           serial[SERIAL_MAX];
-    char           token[32];        // first token, used when reporting >ERR
+    char           token[32];        /* lowercase form, used in >ERR cmd= */
     uint32_t       atm_pa;
     logger_mode_t  fuota_mode;
     uint32_t       fuota_total_bytes;
@@ -90,11 +96,6 @@ static void cli_task(void *arg)
     size_t line_len = 0;
 
     while (1) {
-        // If any logger slot is in LOGGER_FUOTA_AWAIT_CHUNK, divert the next
-        // UART bytes straight into that slot's chunk buffer rather than into
-        // the line buffer. We poll router_fuota_next_expected_bytes() on
-        // each iteration so new FUOTA sessions, or the next expected chunk
-        // after a BLE ack, are picked up without any inter-thread primitives.
         logger_ctx_t *fc_ctx = NULL;
         uint16_t      fc_need = router_fuota_next_expected_bytes(&fc_ctx);
         if (fc_need > 0 && fc_ctx != NULL) {
@@ -110,9 +111,6 @@ static void cli_task(void *arg)
                     fc_ctx->fuota_chunk_data_len = got;
                     continue;
                 }
-                // No data this poll; check whether the session is still in
-                // await-chunk. If not (timed out / aborted on the BT side),
-                // drop the partial buffer and fall through to line mode.
                 vTaskDelay(pdMS_TO_TICKS(CLI_POLL_INTERVAL_MS));
                 if (fc_ctx->state != LOGGER_FUOTA_AWAIT_CHUNK) {
                     fc_ctx->fuota_chunk_data_len = 0;
@@ -138,12 +136,6 @@ static void cli_task(void *arg)
         }
 
         for (size_t i = 0; i < n; i++) {
-            // A FUOTA session may have transitioned to AWAIT_CHUNK while we
-            // were blocked in the line-mode read above. If so, every byte
-            // from this point on is image data, not CLI input — divert the
-            // rest of buf[] into the chunk buffer before losing it to the
-            // line parser. Without this, the first few bytes of chunk 0
-            // (sent immediately after the host sees >FUOTA next) get eaten.
             logger_ctx_t *mid_ctx = NULL;
             uint16_t mid_need = router_fuota_next_expected_bytes(&mid_ctx);
             if (mid_need > 0 && mid_ctx != NULL) {
@@ -155,7 +147,7 @@ static void cli_task(void *arg)
                 memcpy(&dst[got], &buf[i], take);
                 got += (uint16_t)take;
                 mid_ctx->fuota_chunk_data_len = got;
-                i += take - 1;  // for-loop ++i advances past the last copied byte
+                i += take - 1;
                 if (got >= mid_need) {
                     mid_ctx->fuota_chunk_ready = true;
                     (void)sl_bt_external_signal(FUOTA_CHUNK_EXTERNAL_SIGNAL_MASK);
@@ -164,21 +156,16 @@ static void cli_task(void *arg)
             }
 
             char c = (char)buf[i];
-            if (c == '\r') {
-                continue;
-            }
+            if (c == '\r') continue;
             if (c == '\n') {
                 line[line_len] = '\0';
-                if (line_len > 0) {
-                    cli_handle_line(line);
-                }
+                if (line_len > 0) cli_handle_line(line);
                 line_len = 0;
                 continue;
             }
             if (line_len < CLI_LINE_MAX - 1) {
                 line[line_len++] = c;
             } else {
-                // Line too long: drop the overflow and reset on next newline.
                 line_len = 0;
             }
         }
@@ -197,15 +184,27 @@ static void cli_handle_line(char *line)
 
     BaseType_t ok = xQueueSend(cli_queue, &cmd, 0);
     if (ok != pdTRUE) {
-        // Queue full; drop and let the host retry.
         return;
     }
     (void)sl_bt_external_signal(CLI_EXTERNAL_SIGNAL_MASK);
 }
 
+/* Lowercase the token in-place into out->token. The >ERR cmd= field is
+ * lowercase per the wire contract. */
+static void copy_lower(const char *src, char *dst, size_t dst_size)
+{
+    size_t i = 0;
+    while (src[i] && i + 1 < dst_size) {
+        char c = src[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        dst[i] = c;
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static void cli_parse(char *line, cli_cmd_t *out)
 {
-    // Host commands begin with '<'. Anything else is ignored as junk/log echo.
     if (line[0] != '<') {
         out->type = CLI_CMD_INVALID;
         return;
@@ -218,7 +217,7 @@ static void cli_parse(char *line, cli_cmd_t *out)
         out->type = CLI_CMD_INVALID;
         return;
     }
-    strncpy(out->token, tok, sizeof(out->token) - 1);
+    copy_lower(tok, out->token, sizeof(out->token));
 
     if (strcmp(tok, "START") == 0) {
         out->type = CLI_CMD_START;
@@ -228,14 +227,40 @@ static void cli_parse(char *line, cli_cmd_t *out)
         out->type = CLI_CMD_STOP;
         return;
     }
+    if (strcmp(tok, "CONNECT") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
+        strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        out->type = CLI_CMD_CONNECT;
+        return;
+    }
+    if (strcmp(tok, "DISCONNECT") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
+        strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        out->type = CLI_CMD_DISCONNECT;
+        return;
+    }
+    if (strcmp(tok, "MEASURE_START") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
+        strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        out->type = CLI_CMD_MEASURE_START;
+        return;
+    }
+    if (strcmp(tok, "MEASURE_STOP") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
+        strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        out->type = CLI_CMD_MEASURE_STOP;
+        return;
+    }
     if (strcmp(tok, "CALIBRATE") == 0) {
         char *serial = strtok_r(NULL, " \t", &saveptr);
         char *atm    = strtok_r(NULL, " \t", &saveptr);
         if (!serial || !atm) {
             out->type = CLI_CMD_MISSING_ARG;
-            if (serial) {
-                strncpy(out->serial, serial, sizeof(out->serial) - 1);
-            }
+            if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
             return;
         }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
@@ -250,22 +275,16 @@ static void cli_parse(char *line, cli_cmd_t *out)
         out->type = CLI_CMD_CALIBRATE;
         return;
     }
-    if (strcmp(tok, "MEASURE") == 0) {
+    if (strcmp(tok, "WIPEMODBUS") == 0) {
         char *serial = strtok_r(NULL, " \t", &saveptr);
-        if (!serial) {
-            out->type = CLI_CMD_MISSING_ARG;
-            return;
-        }
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
-        out->type = CLI_CMD_MEASURE;
+        out->type = CLI_CMD_WIPEMODBUS;
         return;
     }
     if (strcmp(tok, "IGNORE") == 0) {
         char *serial = strtok_r(NULL, " \t", &saveptr);
-        if (!serial) {
-            out->type = CLI_CMD_MISSING_ARG;
-            return;
-        }
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
         out->type = CLI_CMD_IGNORE;
         return;
@@ -276,9 +295,7 @@ static void cli_parse(char *line, cli_cmd_t *out)
         char *size   = strtok_r(NULL, " \t", &saveptr);
         if (!serial || !target || !size) {
             out->type = CLI_CMD_MISSING_ARG;
-            if (serial) {
-                strncpy(out->serial, serial, sizeof(out->serial) - 1);
-            }
+            if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
             return;
         }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
@@ -303,17 +320,11 @@ static void cli_parse(char *line, cli_cmd_t *out)
         return;
     }
     if (strcmp(tok, "READREGS") == 0) {
-        // The router is opaque to register groups: the host names the group
-        // (processing | pressure | area | outputs | all | ...future...) and
-        // we forward the literal string. Unknown groups are rejected by the
-        // logger as {"Ok":0,"Err":"unknown_group"}.
         char *serial = strtok_r(NULL, " \t", &saveptr);
         char *grp    = strtok_r(NULL, " \t", &saveptr);
         if (!serial || !grp) {
             out->type = CLI_CMD_MISSING_ARG;
-            if (serial) {
-                strncpy(out->serial, serial, sizeof(out->serial) - 1);
-            }
+            if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
             return;
         }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
@@ -323,7 +334,6 @@ static void cli_parse(char *line, cli_cmd_t *out)
             out->type = CLI_CMD_BAD_ARGS;
             return;
         }
-        // Group passed through verbatim — see WRITEREG handler for why.
         memcpy(out->regop_group, grp, glen);
         out->regop_group[glen] = '\0';
         out->type = CLI_CMD_READREGS;
@@ -336,9 +346,7 @@ static void cli_parse(char *line, cli_cmd_t *out)
         char *hex    = strtok_r(NULL, " \t", &saveptr);
         if (!serial || !grp || !key || !hex) {
             out->type = CLI_CMD_MISSING_ARG;
-            if (serial) {
-                strncpy(out->serial, serial, sizeof(out->serial) - 1);
-            }
+            if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
             return;
         }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
@@ -363,9 +371,6 @@ static void cli_parse(char *line, cli_cmd_t *out)
             out->regop_hex[i] = c;
         }
         out->regop_hex[hlen] = '\0';
-        // Group and key are passed through verbatim — the logger's register
-        // table is case-sensitive (keys are stringified C field names with
-        // mixed case, e.g. CtoPa, pc10_Voltage, loggerTempMCU).
         memcpy(out->regop_group, grp, glen);
         out->regop_group[glen] = '\0';
         memcpy(out->regop_key, key, klen);
@@ -375,20 +380,14 @@ static void cli_parse(char *line, cli_cmd_t *out)
     }
     if (strcmp(tok, "COMMITREGS") == 0) {
         char *serial = strtok_r(NULL, " \t", &saveptr);
-        if (!serial) {
-            out->type = CLI_CMD_MISSING_ARG;
-            return;
-        }
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
         out->type = CLI_CMD_COMMITREGS;
         return;
     }
     if (strcmp(tok, "DEFAULTREGS") == 0) {
         char *serial = strtok_r(NULL, " \t", &saveptr);
-        if (!serial) {
-            out->type = CLI_CMD_MISSING_ARG;
-            return;
-        }
+        if (!serial) { out->type = CLI_CMD_MISSING_ARG; return; }
         strncpy(out->serial, serial, sizeof(out->serial) - 1);
         out->type = CLI_CMD_DEFAULTREGS;
         return;
@@ -411,12 +410,28 @@ void cli_dispatch_pending(void)
             router_stop_scanning();
             break;
 
-        case CLI_CMD_CALIBRATE:
-            router_admit_calibrate(cmd.serial, cmd.atm_pa);
+        case CLI_CMD_CONNECT:
+            router_session_open(cmd.serial);
             break;
 
-        case CLI_CMD_MEASURE:
-            router_admit_measure(cmd.serial);
+        case CLI_CMD_DISCONNECT:
+            router_session_close(cmd.serial);
+            break;
+
+        case CLI_CMD_MEASURE_START:
+            router_action_measure_start(cmd.serial);
+            break;
+
+        case CLI_CMD_MEASURE_STOP:
+            router_action_measure_stop(cmd.serial);
+            break;
+
+        case CLI_CMD_CALIBRATE:
+            router_action_calibrate(cmd.serial, cmd.atm_pa);
+            break;
+
+        case CLI_CMD_WIPEMODBUS:
+            router_action_wipe_modbus(cmd.serial);
             break;
 
         case CLI_CMD_IGNORE:
@@ -424,7 +439,7 @@ void cli_dispatch_pending(void)
             break;
 
         case CLI_CMD_FUOTA:
-            router_admit_fuota(cmd.serial, cmd.fuota_mode, cmd.fuota_total_bytes);
+            router_action_fuota(cmd.serial, cmd.fuota_mode, cmd.fuota_total_bytes);
             break;
 
         case CLI_CMD_READREGS:
@@ -445,37 +460,37 @@ void cli_dispatch_pending(void)
             break;
 
         case CLI_CMD_BAD_ARGS:
-            uart_output_err("writereg",
+            uart_output_err(cmd.token,
                             cmd.serial[0] ? cmd.serial : NULL,
-                            "bad args");
+                            REASON_BAD_ARGS);
             break;
 
         case CLI_CMD_UNKNOWN:
-            uart_output_err(cmd.token, NULL, "unknown-command");
+            uart_output_err(cmd.token, NULL, REASON_UNKNOWN_COMMAND);
             break;
 
         case CLI_CMD_BAD_ATM:
             uart_output_err("calibrate",
                             cmd.serial[0] ? cmd.serial : NULL,
-                            "bad-atm-pa");
+                            REASON_BAD_ATM_PA);
             break;
 
         case CLI_CMD_BAD_TARGET:
             uart_output_err("fuota",
                             cmd.serial[0] ? cmd.serial : NULL,
-                            "bad-target");
+                            REASON_BAD_TARGET);
             break;
 
         case CLI_CMD_BAD_SIZE:
             uart_output_err("fuota",
                             cmd.serial[0] ? cmd.serial : NULL,
-                            "bad-size");
+                            REASON_BAD_SIZE);
             break;
 
         case CLI_CMD_MISSING_ARG:
             uart_output_err(cmd.token,
                             cmd.serial[0] ? cmd.serial : NULL,
-                            "missing-arg");
+                            REASON_MISSING_ARG);
             break;
 
         default:

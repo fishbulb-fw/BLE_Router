@@ -26,6 +26,7 @@ source:
 - {path: core/app/src/sl_gatt_service_device_information_override.c}
 - {path: core/drvr/src/drvr_ob2packet.c}
 - {path: core/hal/src/hal_uart_output.c}
+- {path: core/hal/src/hal_wdog.c}
 tag: ['hardware:rf:band:2400']
 include:
 - path: core/app/inc
@@ -34,12 +35,14 @@ include:
   - {path: app_router.h}
   - {path: app_cli.h}
   - {path: app_logger_registry.h}
+  - {path: app_reasons.h}
 - path: core/drvr/inc
   file_list:
   - {path: drvr_ob2packet.h}
 - path: core/hal/inc
   file_list:
   - {path: hal_uart_output.h}
+  - {path: hal_wdog.h}
 sdk: {id: simplicity_sdk, version: 2025.6.3}
 toolchain_settings: []
 component:

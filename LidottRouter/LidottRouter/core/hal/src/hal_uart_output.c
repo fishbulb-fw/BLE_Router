@@ -1,7 +1,7 @@
 /********************
 * Layer: HAL
 * File:  hal_uart_output.c
-* Desc:  UART output abstraction over iostream
+* Desc:  UART output abstraction — emit helpers for the wire protocol.
 */
 #include "hal_uart_output.h"
 #include <stdio.h>
@@ -11,6 +11,10 @@
 
 #define UART_OUTPUT_ENABLED 1
 
+/* Protocol version stamped into every >BOOT. Bump on any breaking change to
+ * the verb/event grammar or reason enum. Mirrors uart-wire-protocol.md. */
+#define UART_PROTO_VERSION 1
+
 void uart_output_init(void)
 {
 }
@@ -19,7 +23,6 @@ void uart_output_log(const char *fmt, ...)
 {
 #if UART_OUTPUT_ENABLED
     va_list args;
-
     printf("#LOG ");
     va_start(args, fmt);
     vprintf(fmt, args);
@@ -27,6 +30,19 @@ void uart_output_log(const char *fmt, ...)
     printf("\r\n");
 #else
     (void)fmt;
+#endif
+}
+
+void uart_output_boot(const char *cause, const char *fw)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">BOOT cause=%s fw=%s proto=%d\r\n",
+           cause ? cause : "unknown",
+           fw    ? fw    : "",
+           UART_PROTO_VERSION);
+#else
+    (void)cause;
+    (void)fw;
 #endif
 }
 
@@ -39,18 +55,25 @@ void uart_output_new(const char *serial)
 #endif
 }
 
-void uart_output_ident(const logger_ctx_t *ctx)
+void uart_output_state(bool scanning_on)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">STATE scanning=%s\r\n", scanning_on ? "on" : "off");
+#else
+    (void)scanning_on;
+#endif
+}
+
+void uart_output_connected(const logger_ctx_t *ctx)
 {
 #if UART_OUTPUT_ENABLED
     const char *id = ctx->serial[0] ? ctx->serial : "UNKNOWN";
-
-    printf(">IDENT serial=%s fw=%s sensor_fw=%s "
-           "s_span=%.3f s_zero=%.3f l_span=%.3f l_zero=%.3f\r\n",
+    printf(">CONNECTED serial=%s fw=%s sensor_fw=%s sensor_serial=%s "
+           "l_pc10_span=%.3f l_pc10_zero=%.3f\r\n",
            id,
            ctx->fw_version[0]     ? ctx->fw_version     : "",
            ctx->sns_fw_version[0] ? ctx->sns_fw_version : "",
-           (double)ctx->pc10_span,
-           (double)ctx->pc10_zero,
+           ctx->sns_serial[0]     ? ctx->sns_serial     : "",
            (double)ctx->l_pc10_span,
            (double)ctx->l_pc10_zero);
 #else
@@ -58,46 +81,55 @@ void uart_output_ident(const logger_ctx_t *ctx)
 #endif
 }
 
-void uart_output_result(const logger_ctx_t *ctx)
+void uart_output_connect_err(const char *serial, const char *phase,
+                             const char *group_or_null, const char *reason)
 {
 #if UART_OUTPUT_ENABLED
-    const char *id = ctx->serial[0] ? ctx->serial : "UNKNOWN";
-
-    printf(">RESULT serial=%s flow=%.3f velocity=%.3f level=%.0f temp=%.1f "
-           "atm=%.1f water=%.1f batt=%.2f\r\n",
-           id,
-           (double)ctx->flow,
-           (double)ctx->velocity,
-           (double)ctx->level,
-           (double)ctx->temperature,
-           (double)ctx->atmo_pressure,
-           (double)ctx->water_pressure,
-           (double)ctx->battery_voltage);
-#else
-    (void)ctx;
-#endif
-}
-
-void uart_output_done(const char *serial, const char *reason)
-{
-#if UART_OUTPUT_ENABLED
-    if (reason && reason[0]) {
-        printf(">DONE serial=%s reason=%s\r\n", serial ? serial : "", reason);
+    const char *s = serial ? serial : "";
+    const char *p = phase ? phase : "";
+    const char *r = reason ? reason : "unknown";
+    if (group_or_null && group_or_null[0]) {
+        printf(">CONNECT err serial=%s phase=%s group=%s reason=%s\r\n",
+               s, p, group_or_null, r);
     } else {
-        printf(">DONE serial=%s\r\n", serial ? serial : "");
+        printf(">CONNECT err serial=%s phase=%s reason=%s\r\n", s, p, r);
     }
 #else
-    (void)serial;
-    (void)reason;
+    (void)serial; (void)phase; (void)group_or_null; (void)reason;
 #endif
 }
 
-void uart_output_state(bool scanning_on)
+void uart_output_disconnected(const char *serial, const char *reason)
 {
 #if UART_OUTPUT_ENABLED
-    printf(">STATE scanning=%s\r\n", scanning_on ? "on" : "off");
+    printf(">DISCONNECTED serial=%s reason=%s\r\n",
+           serial ? serial : "",
+           reason ? reason : "unknown");
 #else
-    (void)scanning_on;
+    (void)serial; (void)reason;
+#endif
+}
+
+void uart_output_results(const char *serial, const char *blob_hex)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">RESULTS serial=%s blob=%s\r\n",
+           serial ? serial : "",
+           blob_hex ? blob_hex : "");
+#else
+    (void)serial; (void)blob_hex;
+#endif
+}
+
+void uart_output_cal(const char *serial, float l_offset_c, float s_offset_c)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">CAL serial=%s l_offset_c=%.3f s_offset_c=%.3f\r\n",
+           serial ? serial : "",
+           (double)l_offset_c,
+           (double)s_offset_c);
+#else
+    (void)serial; (void)l_offset_c; (void)s_offset_c;
 #endif
 }
 
@@ -114,9 +146,7 @@ void uart_output_ack(const char *cmd, const char *serial, const char *extra)
         printf(">ACK cmd=%s\r\n", cmd);
     }
 #else
-    (void)cmd;
-    (void)serial;
-    (void)extra;
+    (void)cmd; (void)serial; (void)extra;
 #endif
 }
 
@@ -131,57 +161,17 @@ void uart_output_err(const char *cmd, const char *serial, const char *reason)
                cmd ? cmd : "", reason ? reason : "unknown");
     }
 #else
-    (void)cmd;
-    (void)serial;
-    (void)reason;
+    (void)cmd; (void)serial; (void)reason;
 #endif
 }
 
-void uart_output_fuota_ready(const char *serial)
+void uart_output_fuota_next(const char *serial, uint16_t bytes)
 {
 #if UART_OUTPUT_ENABLED
-    printf(">FUOTA ready serial=%s\r\n", serial ? serial : "");
+    printf(">FUOTA next serial=%s bytes=%u\r\n",
+           serial ? serial : "", (unsigned)bytes);
 #else
-    (void)serial;
-#endif
-}
-
-void uart_output_fuota_next(const char *serial, uint16_t seq, uint16_t max_bytes)
-{
-#if UART_OUTPUT_ENABLED
-    printf(">FUOTA next serial=%s seq=%u max=%u\r\n",
-           serial ? serial : "", (unsigned)seq, (unsigned)max_bytes);
-#else
-    (void)serial;
-    (void)seq;
-    (void)max_bytes;
-#endif
-}
-
-void uart_output_fuota_verifying(const char *serial)
-{
-#if UART_OUTPUT_ENABLED
-    printf(">FUOTA verifying serial=%s\r\n", serial ? serial : "");
-#else
-    (void)serial;
-#endif
-}
-
-void uart_output_fuota_verified(const char *serial)
-{
-#if UART_OUTPUT_ENABLED
-    printf(">FUOTA verified serial=%s\r\n", serial ? serial : "");
-#else
-    (void)serial;
-#endif
-}
-
-void uart_output_fuota_rebooting(const char *serial)
-{
-#if UART_OUTPUT_ENABLED
-    printf(">FUOTA rebooting serial=%s\r\n", serial ? serial : "");
-#else
-    (void)serial;
+    (void)serial; (void)bytes;
 #endif
 }
 
@@ -192,7 +182,6 @@ void uart_output_fuota_err(const char *serial, const char *phase,
     const char *s = serial ? serial : "";
     const char *p = phase ? phase : "unknown";
     const char *r = reason ? reason : "unknown";
-
     if (seq >= 0) {
         printf(">FUOTA err serial=%s phase=%s seq=%ld reason=%s\r\n",
                s, p, (long)seq, r);
@@ -200,15 +189,12 @@ void uart_output_fuota_err(const char *serial, const char *phase,
         printf(">FUOTA err serial=%s phase=%s reason=%s\r\n", s, p, r);
     }
 #else
-    (void)serial;
-    (void)phase;
-    (void)seq;
-    (void)reason;
+    (void)serial; (void)phase; (void)seq; (void)reason;
 #endif
 }
 
-void uart_output_regs(const char *serial, const char *group,
-                      const char *blob_hex)
+void uart_output_regs_blob(const char *serial, const char *group,
+                           const char *blob_hex)
 {
 #if UART_OUTPUT_ENABLED
     printf(">REGS serial=%s group=%s blob=%s\r\n",
@@ -216,81 +202,30 @@ void uart_output_regs(const char *serial, const char *group,
            group ? group : "",
            blob_hex ? blob_hex : "");
 #else
-    (void)serial;
-    (void)group;
-    (void)blob_hex;
+    (void)serial; (void)group; (void)blob_hex;
 #endif
 }
 
-void uart_output_writeack(const char *serial, const char *group,
-                          const char *key, bool ok, const char *reason)
+void uart_output_regs_write_ok(const char *serial, const char *group,
+                               const char *key)
 {
 #if UART_OUTPUT_ENABLED
-    const char *s = serial ? serial : "";
-    const char *g = group ? group : "";
-    const char *k = key ? key : "";
-    if (ok) {
-        printf(">WRITEACK serial=%s group=%s key=%s ok\r\n", s, g, k);
-    } else {
-        printf(">WRITEACK serial=%s group=%s key=%s err reason=%s\r\n",
-               s, g, k, reason ? reason : "unknown");
-    }
+    printf(">REGS serial=%s group=%s key=%s ok=1\r\n",
+           serial ? serial : "",
+           group ? group : "",
+           key ? key : "");
 #else
-    (void)serial;
-    (void)group;
-    (void)key;
-    (void)ok;
-    (void)reason;
+    (void)serial; (void)group; (void)key;
 #endif
 }
 
-void uart_output_commitack(const char *serial, bool ok, const char *reason)
+void uart_output_regs_op_ok(const char *serial, const char *op)
 {
 #if UART_OUTPUT_ENABLED
-    const char *s = serial ? serial : "";
-    if (ok) {
-        printf(">COMMITACK serial=%s ok\r\n", s);
-    } else {
-        printf(">COMMITACK serial=%s err reason=%s\r\n",
-               s, reason ? reason : "unknown");
-    }
+    printf(">REGS serial=%s op=%s ok=1\r\n",
+           serial ? serial : "",
+           op ? op : "");
 #else
-    (void)serial;
-    (void)ok;
-    (void)reason;
-#endif
-}
-
-void uart_output_defaultack(const char *serial, bool ok, const char *reason)
-{
-#if UART_OUTPUT_ENABLED
-    const char *s = serial ? serial : "";
-    if (ok) {
-        printf(">DEFAULTACK serial=%s ok\r\n", s);
-    } else {
-        printf(">DEFAULTACK serial=%s err reason=%s\r\n",
-               s, reason ? reason : "unknown");
-    }
-#else
-    (void)serial;
-    (void)ok;
-    (void)reason;
-#endif
-}
-
-void uart_output_fuota_result(const char *serial, bool ok, int code)
-{
-#if UART_OUTPUT_ENABLED
-    const char *s = serial ? serial : "";
-
-    if (ok) {
-        printf(">FUOTA result serial=%s status=ack\r\n", s);
-    } else {
-        printf(">FUOTA result serial=%s status=nack code=%d\r\n", s, code);
-    }
-#else
-    (void)serial;
-    (void)ok;
-    (void)code;
+    (void)serial; (void)op;
 #endif
 }

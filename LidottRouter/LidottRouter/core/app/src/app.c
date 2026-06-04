@@ -16,10 +16,17 @@
 #include "app_router.h"
 #include "app_logger_registry.h"
 #include "hal_uart_output.h"
+#include "hal_wdog.h"
 #include "drvr_ob2packet.h"
 #include "app_cli.h"
+#include "sl_bt_version.h"
 #include <string.h>
 #include <stdio.h>
+
+#define STR_(s)   #s
+#define XSTR_(s)  STR_(s)
+#define ROUTER_FW_VERSION_STRING \
+    XSTR_(SL_BT_VERSION_MAJOR) "." XSTR_(SL_BT_VERSION_MINOR) "." XSTR_(SL_BT_VERSION_PATCH)
 
 // Config Serial char UUID: ec4a32a9-3d59-4108-8831-137f1e0a2d9a (little-endian)
 static const uint8_t config_char_uuid[16] = {
@@ -121,6 +128,10 @@ static void debug_log_unmatched_advert(const uint8_t *data, uint8_t data_len)
 
 void app_init(void)
 {
+    // Latch the EMU reset cause before any other init can perturb it.
+    // See docs/adr/0004-hardware-watchdog-and-boot-event.md.
+    hal_wdog_capture_reset_cause();
+
     router_init();
     uart_output_init();
     cli_init();
@@ -149,7 +160,16 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
             sl_bt_scanner_scan_mode_active, 160, 80);
         app_assert_status(sc);
 
-        uart_output_log("Boot complete, awaiting <START");
+        // Emit >BOOT for any non-power-on cause. Cold POR is suppressed
+        // because the Dash app's UART port may not yet be open; WDOG /
+        // LOCKUP / SYSREQ / PIN / EM4 all imply Dash was already listening.
+        // See docs/adr/0004-hardware-watchdog-and-boot-event.md.
+        if (!hal_wdog_reset_was_por()) {
+            uart_output_boot(hal_wdog_reset_cause_string(), ROUTER_FW_VERSION_STRING);
+        }
+
+        // Arm the watchdog now that init is complete and the idle hook can feed it.
+        hal_wdog_start();
         break;
     }
 

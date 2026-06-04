@@ -1,10 +1,12 @@
 /********************
 * Layer: APP
 * File:  app_router.c
-* Desc:  Per-logger state machine and command sequencing
+* Desc:  Per-Session state machine. See docs/uart-wire-protocol.md
+*        for the contract; this file implements it.
 */
 #include "app_router.h"
 #include "app_logger_registry.h"
+#include "app_reasons.h"
 #include "hal_uart_output.h"
 #include "drvr_ob2packet.h"
 #include "FreeRTOS.h"
@@ -12,7 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 
-// Forward decls used before their definitions below.
+/* ---------- Forward decls ---------- */
 static void fuota_send_start(logger_ctx_t *ctx);
 static void fuota_send_verify(logger_ctx_t *ctx);
 static void fuota_send_reboot(logger_ctx_t *ctx);
@@ -30,10 +32,25 @@ static void regop_complete(logger_ctx_t *ctx);
 static void regop_fail(logger_ctx_t *ctx, const char *cmd, const char *reason);
 static const char *regop_cmd_name(regop_kind_t k);
 
-// Service UUID: 7abed2d4-3543-4766-9ac0-8e21726134fd (little-endian)
+static void connect_send_next_regs_read(logger_ctx_t *ctx);
+static void enter_session_idle(logger_ctx_t *ctx);
+static void identify_begin(logger_ctx_t *ctx);
+static void measure_kick_or_idle(logger_ctx_t *ctx);
+static void start_timeout(logger_ctx_t *ctx, uint8_t seconds);
+static void start_timeout_ms(logger_ctx_t *ctx, uint32_t ms);
+static void cancel_timeout(logger_ctx_t *ctx);
+static bool state_is_fuota(logger_state_t s);
+static bool state_in_measure_cycle(logger_state_t s);
+
+/* Service UUID: 7abed2d4-3543-4766-9ac0-8e21726134fd (little-endian) */
 const uint8_t ms4_service_uuid[16] = {
     0xfd, 0x34, 0x61, 0x72, 0x21, 0x8e, 0xc0, 0x9a,
     0x66, 0x47, 0x43, 0x35, 0xd4, 0xd2, 0xbe, 0x7a
+};
+
+/* Canonical CONNECT register-read groups, in the order they're issued. */
+static const char *const k_connect_groups[CONNECT_REGS_COUNT] = {
+    "outputs", "processing", "pressure", "area",
 };
 
 static logger_ctx_t loggers[MAX_LOGGERS];
@@ -46,13 +63,9 @@ typedef struct {
 
 static cooldown_entry_t cooldown_table[MAX_LOGGERS];
 
-// ---- Permanent-for-boot ignore list (MAC-keyed) ----
 static bd_addr ignore_list[MAX_IGNORED];
 static int     ignore_count = 0;
 
-// ---- Pending-decision table: devices announced to the host, awaiting reply.
-// Keyed by serial (primary) with MAC/addr_type stored so admit_* can open the
-// connection without needing another advert to be seen.
 typedef struct {
     bool     valid;
     bd_addr  address;
@@ -62,14 +75,13 @@ typedef struct {
 
 static pending_entry_t pending_table[MAX_PENDING];
 
-// ---- Scanner gating ----
 static bool scanning_enabled  = false;
 static bool scanner_running   = false;
 static bool stop_pending_drain = false;
 
-// ============================================================================
-// Cooldown table (kept from original implementation, used by failure paths)
-// ============================================================================
+/* ============================================================================
+ * Cooldown
+ * ============================================================================ */
 
 bool router_is_in_cooldown(const bd_addr *address)
 {
@@ -95,16 +107,13 @@ void router_mark_cooldown(const bd_addr *address)
     uint32_t expire = xTaskGetTickCount() + (COOLDOWN_SECONDS * configTICK_RATE_HZ);
 
     for (int i = 0; i < MAX_LOGGERS; i++) {
-
         if (cooldown_table[i].valid
             && memcmp(&cooldown_table[i].address, address, sizeof(bd_addr)) == 0) {
             cooldown_table[i].cooldown_until_tick = expire;
             return;
         }
     }
-
     for (int i = 0; i < MAX_LOGGERS; i++) {
-
         if (!cooldown_table[i].valid) {
             memcpy(&cooldown_table[i].address, address, sizeof(bd_addr));
             cooldown_table[i].cooldown_until_tick = expire;
@@ -112,11 +121,8 @@ void router_mark_cooldown(const bd_addr *address)
             return;
         }
     }
-
     int oldest = 0;
-
     for (int i = 1; i < MAX_LOGGERS; i++) {
-
         if ((int32_t)(cooldown_table[i].cooldown_until_tick
                     - cooldown_table[oldest].cooldown_until_tick) < 0) {
             oldest = i;
@@ -126,9 +132,9 @@ void router_mark_cooldown(const bd_addr *address)
     cooldown_table[oldest].cooldown_until_tick = expire;
 }
 
-// ============================================================================
-// Ignore list
-// ============================================================================
+/* ============================================================================
+ * Ignore list
+ * ============================================================================ */
 
 bool router_is_ignored(const bd_addr *mac)
 {
@@ -144,7 +150,6 @@ static void ignore_list_add(const bd_addr *mac)
 {
     if (router_is_ignored(mac)) return;
     if (ignore_count >= MAX_IGNORED) {
-        // Overwrite the oldest entry (FIFO-ish). Rare in practice.
         memmove(&ignore_list[0], &ignore_list[1],
                 sizeof(bd_addr) * (MAX_IGNORED - 1));
         ignore_count = MAX_IGNORED - 1;
@@ -153,9 +158,9 @@ static void ignore_list_add(const bd_addr *mac)
     ignore_count++;
 }
 
-// ============================================================================
-// Pending-decision table
-// ============================================================================
+/* ============================================================================
+ * Pending-decision table
+ * ============================================================================ */
 
 static pending_entry_t *pending_find_by_mac(const bd_addr *mac)
 {
@@ -195,9 +200,9 @@ static void pending_free(pending_entry_t *e)
     e->valid = false;
 }
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
+/* ============================================================================
+ * Lifecycle / lookup
+ * ============================================================================ */
 
 void router_init(void)
 {
@@ -294,9 +299,38 @@ int router_active_count(void)
     return count;
 }
 
-// ============================================================================
-// Scanner gating
-// ============================================================================
+static bool state_is_fuota(logger_state_t s)
+{
+    return s == LOGGER_FUOTA_START_SENT
+        || s == LOGGER_FUOTA_ERASE_WAIT
+        || s == LOGGER_FUOTA_AWAIT_CHUNK
+        || s == LOGGER_FUOTA_CHUNK_SENT
+        || s == LOGGER_FUOTA_VERIFY_SENT
+        || s == LOGGER_FUOTA_REBOOT_SENT
+        || s == LOGGER_FUOTA_POST_REBOOT_WAIT;
+}
+
+bool router_fuota_in_flight(void)
+{
+    for (int i = 0; i < MAX_LOGGERS; i++) {
+        if (loggers[i].state != LOGGER_IDLE
+         && (state_is_fuota(loggers[i].state) || loggers[i].fuota_rejoin_pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool state_in_measure_cycle(logger_state_t s)
+{
+    return s == LOGGER_TRIGGER_MEASURE
+        || s == LOGGER_MEASURE_READ_OUTPUTS
+        || s == LOGGER_MEASURE_WAIT;
+}
+
+/* ============================================================================
+ * Scanner gating
+ * ============================================================================ */
 
 bool router_scanning_enabled(void)
 {
@@ -311,6 +345,14 @@ void router_ensure_scanner_running(void)
 
     sl_status_t sc = sl_bt_scanner_start(
         sl_bt_gap_phy_1m, sl_bt_scanner_discover_generic);
+    if (sc == SL_STATUS_INVALID_STATE) {
+        /* Stack scanner state has drifted from our flag (typically after a
+         * connection_opened/closed transition left it half-armed). Force a
+         * stop to resync and retry once. */
+        (void)sl_bt_scanner_stop();
+        sc = sl_bt_scanner_start(
+            sl_bt_gap_phy_1m, sl_bt_scanner_discover_generic);
+    }
     if (sc == SL_STATUS_OK) {
         scanner_running = true;
     } else {
@@ -321,32 +363,42 @@ void router_ensure_scanner_running(void)
 
 void router_start_scanning(void)
 {
-    if (scanning_enabled) {
-        uart_output_ack("start", NULL, NULL);
-        return;
+    /* Hard reset: a fresh <START always returns the router to a clean slate.
+     * Any sessions left open by a previous host (e.g. a page that closed
+     * without DISCONNECT) are torn down, and stale pending adverts dropped.
+     * Each torn-down session still emits >DISCONNECTED so the host can
+     * observe the cleanup. FUOTA/calibrate guards are bypassed deliberately
+     * — START is the escape hatch. */
+    for (int i = 0; i < MAX_LOGGERS; i++) {
+        logger_ctx_t *ctx = &loggers[i];
+        if (ctx->state == LOGGER_IDLE) continue;
+        if (ctx->state == LOGGER_DISCONNECTING) continue;
+        ctx->measure_active = false;
+        ctx->fuota_rejoin_pending = false;
+        ctx->disconnect_reason = REASON_HOST;
+        cancel_timeout(ctx);
+        if (ctx->connection_handle != 0xFF) {
+            ctx->state = LOGGER_DISCONNECTING;
+            sl_bt_connection_close(ctx->connection_handle);
+        } else {
+            router_free_slot(ctx);
+        }
     }
+    memset(pending_table, 0, sizeof(pending_table));
+
     scanning_enabled  = true;
     stop_pending_drain = false;
     router_ensure_scanner_running();
-    uart_output_ack("start", NULL, NULL);
     uart_output_state(true);
 }
 
 void router_stop_scanning(void)
 {
-    if (!scanning_enabled && !scanner_running) {
-        uart_output_ack("stop", NULL, NULL);
-        return;
-    }
     scanning_enabled = false;
     if (scanner_running) {
         sl_bt_scanner_stop();
         scanner_running = false;
     }
-    uart_output_ack("stop", NULL, NULL);
-
-    // If no devices are active, we can emit the off-state immediately.
-    // Otherwise defer until the last one disconnects.
     if (router_active_count() == 0) {
         uart_output_state(false);
         stop_pending_drain = false;
@@ -355,9 +407,9 @@ void router_stop_scanning(void)
     }
 }
 
-// ============================================================================
-// Advert handling — public entry point called from sl_bt_on_event
-// ============================================================================
+/* ============================================================================
+ * Advert handling
+ * ============================================================================ */
 
 void router_on_new_advert(const bd_addr *mac, uint8_t addr_type,
                           const char *serial)
@@ -367,15 +419,11 @@ void router_on_new_advert(const bd_addr *mac, uint8_t addr_type,
     if (router_is_connected(mac)) return;
 
     if (pending_find_by_mac(mac) != NULL) {
-        // Already announced to host; suppress dedupe re-announcements.
         return;
     }
 
     pending_entry_t *e = pending_alloc();
-    if (!e) {
-        // Table full — drop silently; next advert retries.
-        return;
-    }
+    if (!e) return;
     e->valid = true;
     memcpy(&e->address, mac, sizeof(bd_addr));
     e->address_type = addr_type;
@@ -385,105 +433,243 @@ void router_on_new_advert(const bd_addr *mac, uint8_t addr_type,
     uart_output_new(e->serial);
 }
 
-// ============================================================================
-// Host command entry points — called from cli_dispatch_pending on BT thread
-// ============================================================================
+/* ============================================================================
+ * Host command entry points
+ * ============================================================================ */
 
-static bool router_open_admitted(pending_entry_t *e, logger_ctx_t **out_ctx)
+void router_session_open(const char *serial)
 {
+    if (router_find_by_serial(serial) != NULL) {
+        uart_output_err("connect", serial, REASON_ALREADY_OPEN);
+        return;
+    }
+
+    pending_entry_t *e = pending_find_by_serial(serial);
+    if (!e) {
+        /* No advert seen yet — surface as no_session so the Host can wait
+         * for the next >NEW and retry. */
+        uart_output_err("connect", serial, REASON_NO_SESSION);
+        return;
+    }
+
+    if (router_is_in_cooldown(&e->address)) {
+        uart_output_err("connect", serial, REASON_COOLDOWN);
+        return;
+    }
+
     logger_ctx_t *ctx = router_allocate_slot();
     if (!ctx) {
-        return false;
+        uart_output_err("connect", NULL, REASON_NO_SLOT);
+        return;
     }
     ctx->state = LOGGER_CONNECTING;
     memcpy(&ctx->address, &e->address, sizeof(bd_addr));
     ctx->address_type = e->address_type;
     strncpy(ctx->serial, e->serial, SERIAL_MAX - 1);
     ctx->serial[SERIAL_MAX - 1] = '\0';
+    ctx->mode = LOGGER_MODE_MEASURE;
+    ctx->measure_active = false;
 
     sl_status_t sc = sl_bt_connection_open(
         e->address, e->address_type,
         sl_bt_gap_phy_1m, &ctx->connection_handle);
     if (sc != SL_STATUS_OK) {
+        uart_output_connect_err(serial, PHASE_BLE, NULL, REASON_BLE);
+        router_mark_cooldown(&ctx->address);
         router_free_slot(ctx);
-        return false;
+        return;
     }
-    // The BT stack auto-stops scanning while a connection is being opened.
-    // Reflect that in our cached flag so router_ensure_scanner_running will
-    // restart it once the connection finishes establishing.
     scanner_running = false;
-    *out_ctx = ctx;
-    return true;
-}
-
-bool router_admit_calibrate(const char *serial, uint32_t atm_pa)
-{
-    pending_entry_t *e = pending_find_by_serial(serial);
-    if (!e) {
-        uart_output_err("calibrate", serial, "unknown-serial");
-        return false;
-    }
-    logger_ctx_t *ctx = NULL;
-    if (!router_open_admitted(e, &ctx)) {
-        uart_output_err("calibrate", serial, "no-slot");
-        return false;
-    }
-    ctx->calibrate_requested = true;
-    ctx->repeat_measure      = true;
-    ctx->host_atm_pa         = atm_pa;
     pending_free(e);
-
-    char extra[32];
-    snprintf(extra, sizeof(extra), "atm_pa=%lu", (unsigned long)atm_pa);
-    uart_output_ack("calibrate", serial, extra);
-    return true;
 }
 
-bool router_admit_measure(const char *serial)
+void router_session_close(const char *serial)
 {
-    pending_entry_t *e = pending_find_by_serial(serial);
-    if (!e) {
-        uart_output_err("measure", serial, "unknown-serial");
-        return false;
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_err("disconnect", serial, REASON_NO_SESSION);
+        return;
     }
-    logger_ctx_t *ctx = NULL;
-    if (!router_open_admitted(e, &ctx)) {
-        uart_output_err("measure", serial, "no-slot");
-        return false;
-    }
-    ctx->calibrate_requested = false;
-    ctx->repeat_measure      = true;
-    ctx->host_atm_pa         = 0;
-    pending_free(e);
 
-    uart_output_ack("measure", serial, NULL);
-    return true;
+    /* Refuse if a non-measure workflow is in flight. Measure stops implicitly. */
+    if (state_is_fuota(ctx->state) || ctx->fuota_rejoin_pending) {
+        uart_output_err("disconnect", serial, REASON_BUSY_FUOTA);
+        return;
+    }
+    if (ctx->state == LOGGER_CALIBRATE
+     || ctx->state == LOGGER_CALIBRATE_SETTLE
+     || ctx->state == LOGGER_CALIBRATE_READBACK) {
+        uart_output_err("disconnect", serial, REASON_BUSY_CALIBRATE);
+        return;
+    }
+
+    ctx->measure_active = false;
+    ctx->disconnect_reason = REASON_HOST;
+    cancel_timeout(ctx);
+    ctx->state = LOGGER_DISCONNECTING;
+    sl_bt_connection_close(ctx->connection_handle);
 }
 
-bool router_admit_fuota(const char *serial, logger_mode_t mode,
-                        uint32_t total_bytes)
+/* Common session-action precondition check. Returns NULL on refusal (after
+ * emitting the appropriate >ERR). */
+static logger_ctx_t *require_session_idle_or_measure(const char *cmd,
+                                                     const char *serial)
+{
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_err(cmd, serial, REASON_NO_SESSION);
+        return NULL;
+    }
+    if (state_is_fuota(ctx->state) || ctx->fuota_rejoin_pending) {
+        uart_output_err(cmd, serial, REASON_BUSY_FUOTA);
+        return NULL;
+    }
+    /* Allow SESSION_IDLE and any measure-cycle state; reject anything else
+     * (connecting, calibrating, disconnecting). */
+    if (ctx->state != LOGGER_SESSION_IDLE
+     && !state_in_measure_cycle(ctx->state)) {
+        uart_output_err(cmd, serial, REASON_NO_SESSION);
+        return NULL;
+    }
+    return ctx;
+}
+
+void router_action_measure_start(const char *serial)
+{
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_err("measure_start", serial, REASON_NO_SESSION);
+        return;
+    }
+    if (router_fuota_in_flight()) {
+        uart_output_err("measure_start", serial, REASON_BUSY_FUOTA);
+        return;
+    }
+    if (ctx->state == LOGGER_CALIBRATE
+     || ctx->state == LOGGER_CALIBRATE_SETTLE
+     || ctx->state == LOGGER_CALIBRATE_READBACK) {
+        uart_output_err("measure_start", serial, REASON_BUSY_CALIBRATE);
+        return;
+    }
+    if (ctx->state != LOGGER_SESSION_IDLE
+     && !state_in_measure_cycle(ctx->state)) {
+        uart_output_err("measure_start", serial, REASON_NO_SESSION);
+        return;
+    }
+    /* Idempotent. */
+    uart_output_ack("measure_start", serial, NULL);
+    if (ctx->measure_active) return;
+    ctx->measure_active = true;
+    ctx->measure_stop_pending = false;
+    if (ctx->state == LOGGER_SESSION_IDLE) {
+        measure_kick_or_idle(ctx);
+    }
+}
+
+void router_action_measure_stop(const char *serial)
+{
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_err("measure_stop", serial, REASON_NO_SESSION);
+        return;
+    }
+    /* Idempotent. */
+    uart_output_ack("measure_stop", serial, NULL);
+    if (!ctx->measure_active && ctx->state == LOGGER_SESSION_IDLE) return;
+    ctx->measure_active = false;
+    if (ctx->state == LOGGER_MEASURE_WAIT) {
+        cancel_timeout(ctx);
+        enter_session_idle(ctx);
+    } else if (state_in_measure_cycle(ctx->state)) {
+        /* Mid-cycle: let it finish, but don't re-trigger. */
+        ctx->measure_stop_pending = true;
+    }
+}
+
+void router_action_calibrate(const char *serial, uint32_t atm_pa)
+{
+    logger_ctx_t *ctx = require_session_idle_or_measure("calibrate", serial);
+    if (!ctx) return;
+    if (router_fuota_in_flight()) {
+        uart_output_err("calibrate", serial, REASON_BUSY_FUOTA);
+        return;
+    }
+    if (ctx->measure_active || state_in_measure_cycle(ctx->state)) {
+        uart_output_err("calibrate", serial, REASON_BUSY_MEASURING);
+        return;
+    }
+
+    ctx->host_atm_pa = atm_pa;
+    char cal_cmd[64];
+    snprintf(cal_cmd, sizeof(cal_cmd),
+             "{\"LVC\":15,\"Value\":%lu}", (unsigned long)atm_pa);
+    router_send_command(ctx, ctx->data_char_handle,
+                        cal_cmd, LOGGER_CALIBRATE);
+    start_timeout(ctx, 30);
+}
+
+void router_action_wipe_modbus(const char *serial)
+{
+    logger_ctx_t *ctx = require_session_idle_or_measure("wipemodbus", serial);
+    if (!ctx) return;
+    if (router_fuota_in_flight()) {
+        uart_output_err("wipemodbus", serial, REASON_BUSY_FUOTA);
+        return;
+    }
+    if (ctx->measure_active || state_in_measure_cycle(ctx->state)) {
+        uart_output_err("wipemodbus", serial, REASON_BUSY_MEASURING);
+        return;
+    }
+
+    /* SF:9 zeroes the logger's modbus_mem FRAM blob; it rebuilds from
+     * defaults on the next reboot. Type-family settings message, so it
+     * goes on data_char_handle and its reply arrives as a notification. */
+    router_send_command(ctx, ctx->data_char_handle,
+                        "{\"Type\":22,\"Dir\":\"set\",\"Value\":9}",
+                        LOGGER_WIPE_SENT);
+    start_timeout(ctx, 5);
+}
+
+void router_action_fuota(const char *serial, logger_mode_t mode,
+                         uint32_t total_bytes)
 {
     if (mode != LOGGER_MODE_FUOTA_LOGGER && mode != LOGGER_MODE_FUOTA_SENSOR) {
-        uart_output_err("fuota", serial, "bad-target");
-        return false;
+        uart_output_err("fuota", serial, REASON_BAD_TARGET);
+        return;
     }
     if (total_bytes == 0) {
-        uart_output_err("fuota", serial, "zero-bytes");
-        return false;
+        uart_output_err("fuota", serial, REASON_BAD_SIZE);
+        return;
     }
-    pending_entry_t *e = pending_find_by_serial(serial);
-    if (!e) {
-        uart_output_err("fuota", serial, "unknown-serial");
-        return false;
+
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_err("fuota", serial, REASON_NO_SESSION);
+        return;
     }
-    logger_ctx_t *ctx = NULL;
-    if (!router_open_admitted(e, &ctx)) {
-        uart_output_err("fuota", serial, "no-slot");
-        return false;
+    if (state_is_fuota(ctx->state) || ctx->fuota_rejoin_pending) {
+        uart_output_err("fuota", serial, REASON_BUSY_FUOTA);
+        return;
     }
+    if (ctx->state == LOGGER_CALIBRATE
+     || ctx->state == LOGGER_CALIBRATE_SETTLE
+     || ctx->state == LOGGER_CALIBRATE_READBACK) {
+        uart_output_err("fuota", serial, REASON_BUSY_CALIBRATE);
+        return;
+    }
+    if (ctx->state != LOGGER_SESSION_IDLE
+     && !state_in_measure_cycle(ctx->state)) {
+        uart_output_err("fuota", serial, REASON_NO_SESSION);
+        return;
+    }
+
+    /* Implicitly stop any measure loop on this Session. */
+    ctx->measure_active = false;
+    if (state_in_measure_cycle(ctx->state)) {
+        cancel_timeout(ctx);
+    }
+
     ctx->mode              = mode;
-    ctx->repeat_measure    = false;
-    ctx->calibrate_requested = false;
     ctx->fuota_total_bytes = total_bytes;
     ctx->fuota_sent_bytes  = 0;
     ctx->fuota_seq         = 0;
@@ -491,33 +677,25 @@ bool router_admit_fuota(const char *serial, logger_mode_t mode,
     ctx->fuota_chunk_ready = false;
     ctx->fuota_chunk_data_len = 0;
     if (mode == LOGGER_MODE_FUOTA_LOGGER) {
-        ctx->fuota_chunk_type  = OB2PACKET_PAYLOAD_BINARY;       // 0x02
-        ctx->fuota_max_payload = FUOTA_LOGGER_CHUNK_MAX;         // 248
+        ctx->fuota_chunk_type  = OB2PACKET_PAYLOAD_BINARY;
+        ctx->fuota_max_payload = FUOTA_LOGGER_CHUNK_MAX;
+        ctx->fuota_char_handle = ctx->config_char_handle;
     } else {
-        ctx->fuota_chunk_type  = 0x03;                           // sensor binary
-        ctx->fuota_max_payload = FUOTA_SENSOR_CHUNK_MAX;         // 238
+        ctx->fuota_chunk_type  = 0x03;
+        ctx->fuota_max_payload = FUOTA_SENSOR_CHUNK_MAX;
+        ctx->fuota_char_handle = ctx->data_char_handle;
     }
-    pending_free(e);
-
-    char extra[48];
-    snprintf(extra, sizeof(extra), "target=%s bytes=%lu",
-             mode == LOGGER_MODE_FUOTA_LOGGER ? "logger" : "sensor",
-             (unsigned long)total_bytes);
-    uart_output_ack("fuota", serial, extra);
-    return true;
+    fuota_send_start(ctx);
 }
 
 void router_ignore(const char *serial)
 {
     logger_ctx_t *ctx = router_find_by_serial(serial);
     if (ctx) {
+        /* Per ADR-0007 / wire protocol: <IGNORE does NOT close an open
+         * Session. Just add the MAC to the suppress list and ack. */
         ignore_list_add(&ctx->address);
         uart_output_ack("ignore", serial, NULL);
-        // Mark repeat_measure off so the loop won't re-enter TRIGGER_MEASURE.
-        ctx->repeat_measure = false;
-        ctx->state = LOGGER_DISCONNECTING;
-        sl_bt_connection_close(ctx->connection_handle);
-        // >DONE will be emitted in router_on_disconnected.
         return;
     }
 
@@ -529,52 +707,57 @@ void router_ignore(const char *serial)
         return;
     }
 
-    uart_output_err("ignore", serial, "unknown-serial");
+    /* No prior advert and no open Session — still record an ack, since
+     * the host's intent (suppress this serial) is unambiguous. */
+    uart_output_ack("ignore", serial, NULL);
 }
 
-// ============================================================================
-// Modbus register editor — host command entry points
-// ============================================================================
+/* ============================================================================
+ * Reg-ops
+ * ============================================================================ */
 
-static bool regop_device_ready(const char *cmd, const char *serial,
-                               logger_ctx_t **out_ctx)
+static bool regop_session_ready(const char *cmd, const char *serial,
+                                logger_ctx_t **out_ctx)
 {
     logger_ctx_t *ctx = router_find_by_serial(serial);
     if (!ctx) {
-        uart_output_err(cmd, serial, "device not connected");
+        uart_output_err(cmd, serial, REASON_NO_SESSION);
         return false;
     }
-    // Only allow reg ops once the device has finished discovery + ident and
-    // is participating in the measure loop. Earlier states are still bringing
-    // the link up.
+    if (state_is_fuota(ctx->state) || ctx->fuota_rejoin_pending) {
+        uart_output_err(cmd, serial, REASON_BUSY_FUOTA);
+        return false;
+    }
     if (ctx->state == LOGGER_CONNECTING
      || ctx->state == LOGGER_DISCOVER_SERVICE
      || ctx->state == LOGGER_DISCOVER_CHARS
      || ctx->state == LOGGER_SUBSCRIBE_CONFIG
      || ctx->state == LOGGER_SUBSCRIBE_DATA
+     || ctx->state == LOGGER_GET_FW_VERSION
+     || ctx->state == LOGGER_GET_SNS_FW
+     || ctx->state == LOGGER_GET_PC10_ZERO
+     || ctx->state == LOGGER_GET_PC10_SPAN
+     || ctx->state == LOGGER_PRIME_PRESSURE
+     || ctx->state == LOGGER_CONNECT_REGS
      || ctx->state == LOGGER_DISCONNECTING) {
-        uart_output_err(cmd, serial, "device not connected");
-        return false;
-    }
-    if (ctx->mode != LOGGER_MODE_MEASURE) {
-        uart_output_err(cmd, serial, "device busy");
+        uart_output_err(cmd, serial, REASON_NO_SESSION);
         return false;
     }
     if (ctx->regop_pending != REGOP_NONE) {
-        uart_output_err(cmd, serial, "regop busy");
+        uart_output_err(cmd, serial, REASON_BAD_ARGS);
         return false;
     }
     *out_ctx = ctx;
     return true;
 }
 
-bool router_admit_readregs(const char *serial, const char *group)
+void router_admit_readregs(const char *serial, const char *group)
 {
     logger_ctx_t *ctx = NULL;
-    if (!regop_device_ready("readregs", serial, &ctx)) return false;
+    if (!regop_session_ready("readregs", serial, &ctx)) return;
     if (!group || group[0] == '\0' || strlen(group) >= REGOP_GROUP_BUF) {
-        uart_output_err("readregs", serial, "bad group");
-        return false;
+        uart_output_err("readregs", serial, REASON_BAD_ARGS);
+        return;
     }
     ctx->regop_pending = REGOP_READ;
     ctx->regop_retries = 0;
@@ -582,14 +765,13 @@ bool router_admit_readregs(const char *serial, const char *group)
     ctx->regop_group[REGOP_GROUP_BUF - 1] = '\0';
     ctx->regop_key[0] = ctx->regop_hex[0] = '\0';
     (void)try_dispatch_regop(ctx);
-    return true;
 }
 
-bool router_admit_writereg(const char *serial, const char *group,
+void router_admit_writereg(const char *serial, const char *group,
                            const char *key, const char *hex_val)
 {
     logger_ctx_t *ctx = NULL;
-    if (!regop_device_ready("writereg", serial, &ctx)) return false;
+    if (!regop_session_ready("writereg", serial, &ctx)) return;
     ctx->regop_pending = REGOP_WRITE;
     ctx->regop_retries = 0;
     strncpy(ctx->regop_group, group ? group : "", REGOP_GROUP_BUF - 1);
@@ -599,34 +781,31 @@ bool router_admit_writereg(const char *serial, const char *group,
     strncpy(ctx->regop_hex, hex_val ? hex_val : "", REGOP_HEX_BUF - 1);
     ctx->regop_hex[REGOP_HEX_BUF - 1] = '\0';
     (void)try_dispatch_regop(ctx);
-    return true;
 }
 
-bool router_admit_commitregs(const char *serial)
+void router_admit_commitregs(const char *serial)
 {
     logger_ctx_t *ctx = NULL;
-    if (!regop_device_ready("commitregs", serial, &ctx)) return false;
+    if (!regop_session_ready("commitregs", serial, &ctx)) return;
     ctx->regop_pending = REGOP_COMMIT;
     ctx->regop_retries = 0;
     ctx->regop_group[0] = ctx->regop_key[0] = ctx->regop_hex[0] = '\0';
     (void)try_dispatch_regop(ctx);
-    return true;
 }
 
-bool router_admit_defaultregs(const char *serial)
+void router_admit_defaultregs(const char *serial)
 {
     logger_ctx_t *ctx = NULL;
-    if (!regop_device_ready("defaultregs", serial, &ctx)) return false;
+    if (!regop_session_ready("defaultregs", serial, &ctx)) return;
     ctx->regop_pending = REGOP_DEFAULT;
     ctx->regop_retries = 0;
     ctx->regop_group[0] = ctx->regop_key[0] = ctx->regop_hex[0] = '\0';
     (void)try_dispatch_regop(ctx);
-    return true;
 }
 
-// ============================================================================
-// Legacy helpers — GATT procedure / notification / timer handling
-// ============================================================================
+/* ============================================================================
+ * BLE plumbing
+ * ============================================================================ */
 
 #define USE_OB2_FRAMING 1
 
@@ -660,55 +839,91 @@ static void start_timeout(logger_ctx_t *ctx, uint8_t seconds)
         (uint32_t)seconds * 32768, 0, ctx->timer_handle, 0);
 }
 
+static void start_timeout_ms(logger_ctx_t *ctx, uint32_t ms)
+{
+    uint32_t ticks = (uint32_t)(((uint64_t)ms * 32768u) / 1000u);
+    sl_bt_system_set_lazy_soft_timer(ticks, 0, ctx->timer_handle, 0);
+}
+
 static void cancel_timeout(logger_ctx_t *ctx)
 {
     sl_bt_system_set_lazy_soft_timer(0, 0, ctx->timer_handle, 0);
 }
 
-static void start_timeout_ms(logger_ctx_t *ctx, uint32_t ms)
+/* Tear down with a connect-phase error. Used during the open sequence
+ * (BLE/identify/readregs) — emits >CONNECT err + cooldown. */
+static void connect_fail(logger_ctx_t *ctx, const char *phase,
+                         const char *group_or_null, const char *reason)
 {
-    // 32768 ticks/s; (ms * 32768) / 1000 = ms * 32768 / 1000.
-    uint32_t ticks = (uint32_t)(((uint64_t)ms * 32768u) / 1000u);
-    sl_bt_system_set_lazy_soft_timer(ticks, 0, ctx->timer_handle, 0);
-}
-
-static void disconnect_with_error(logger_ctx_t *ctx, const char *reason)
-{
-    uart_output_log("%s [%s]", reason, ctx->serial[0] ? ctx->serial : "unknown");
+    if (ctx->serial[0]) {
+        uart_output_connect_err(ctx->serial, phase, group_or_null, reason);
+    } else {
+        uart_output_connect_err("", phase, group_or_null, reason);
+    }
     cancel_timeout(ctx);
     router_mark_cooldown(&ctx->address);
-    ctx->repeat_measure = false;
+    ctx->disconnect_reason = NULL;  /* freed silently; >CONNECT err already sent */
     ctx->state = LOGGER_DISCONNECTING;
     sl_bt_connection_close(ctx->connection_handle);
 }
 
 void router_on_connected(logger_ctx_t *ctx)
 {
-    uart_output_log("Connected, handle=%d, discovering service...",
-                    ctx->connection_handle);
+    uart_output_log("Connected handle=%d", ctx->connection_handle);
     ctx->state = LOGGER_DISCOVER_SERVICE;
     start_timeout(ctx, 150);
     sl_status_t sc = sl_bt_gatt_discover_primary_services_by_uuid(
         ctx->connection_handle, 16, ms4_service_uuid);
     if (sc != SL_STATUS_OK) {
-        uart_output_log("GATT discover failed: 0x%04lX", (unsigned long)sc);
-        disconnect_with_error(ctx, "GATT discover call failed");
+        connect_fail(ctx, PHASE_BLE, NULL, REASON_BLE);
     }
 }
 
 void router_on_disconnected(logger_ctx_t *ctx)
 {
-    // If a reg op was in flight, surface a clear error to the host so the
-    // dash app can clear its per-device pending state (brief 3.6, 5.5).
+    /* Logger-FUOTA rejoin: keep slot, reopen BLE, re-run identify + 4 reads
+     * → fresh >CONNECTED. No >DISCONNECTED is emitted on this path. */
+    if (ctx->fuota_rejoin_pending) {
+        bd_addr addr;
+        uint8_t addr_type;
+        memcpy(&addr, &ctx->address, sizeof(bd_addr));
+        addr_type = ctx->address_type;
+        ctx->state = LOGGER_CONNECTING;
+        ctx->mode = LOGGER_MODE_MEASURE;
+        ctx->measure_active = false;
+        ctx->connect_regs_idx = 0;
+        ctx->rx_len = 0;
+        ctx->connection_handle = 0xFF;
+        sl_status_t sc = sl_bt_connection_open(
+            addr, addr_type, sl_bt_gap_phy_1m, &ctx->connection_handle);
+        if (sc == SL_STATUS_OK) {
+            scanner_running = false;
+            return;
+        }
+        /* Reopen failed — fall through to the regular tear-down path,
+         * surfacing it as a >CONNECT err on the rejoin phase. */
+        uart_output_connect_err(ctx->serial, PHASE_REJOIN, NULL, REASON_BLE);
+        router_mark_cooldown(&ctx->address);
+        ctx->fuota_rejoin_pending = false;
+        router_free_slot(ctx);
+        return;
+    }
+
+    /* Surface a regop-in-flight failure to the host. */
     if (ctx->regop_pending != REGOP_NONE) {
         const char *cmd = regop_cmd_name(ctx->regop_pending);
         if (ctx->serial[0]) {
-            uart_output_err(cmd, ctx->serial, "disconnected");
+            uart_output_err(cmd, ctx->serial, REASON_BLE_LINK_LOSS);
         }
     }
-    if (ctx->serial[0]) {
-        uart_output_done(ctx->serial, NULL);
+
+    if (ctx->serial[0] && ctx->disconnect_reason != NULL) {
+        uart_output_disconnected(ctx->serial, ctx->disconnect_reason);
+    } else if (ctx->serial[0]) {
+        /* Unsolicited link loss: no Host disconnect, no rejoin scheduled. */
+        uart_output_disconnected(ctx->serial, REASON_BLE_LINK_LOSS);
     }
+
     router_free_slot(ctx);
 
     if (stop_pending_drain && router_active_count() == 0) {
@@ -721,7 +936,33 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
 {
     if (result != SL_STATUS_OK) {
         uart_output_log("GATT error 0x%04X in state %d", result, ctx->state);
-        disconnect_with_error(ctx, "GATT procedure failed");
+        /* During open: surface as connect_err. Otherwise: tear down session. */
+        if (ctx->state == LOGGER_CONNECTING
+         || ctx->state == LOGGER_DISCOVER_SERVICE
+         || ctx->state == LOGGER_DISCOVER_CHARS
+         || ctx->state == LOGGER_SUBSCRIBE_CONFIG
+         || ctx->state == LOGGER_SUBSCRIBE_DATA
+         || ctx->state == LOGGER_GET_FW_VERSION
+         || ctx->state == LOGGER_GET_SNS_FW
+         || ctx->state == LOGGER_GET_PC10_ZERO
+         || ctx->state == LOGGER_GET_PC10_SPAN
+         || ctx->state == LOGGER_PRIME_PRESSURE
+         || ctx->state == LOGGER_CONNECT_REGS) {
+            const char *phase =
+                (ctx->state == LOGGER_CONNECT_REGS) ? PHASE_READREGS :
+                (ctx->state >= LOGGER_GET_FW_VERSION
+                 && ctx->state <= LOGGER_PRIME_PRESSURE) ? PHASE_IDENTIFY : PHASE_BLE;
+            const char *grp = (ctx->state == LOGGER_CONNECT_REGS
+                               && ctx->connect_regs_idx < CONNECT_REGS_COUNT)
+                              ? k_connect_groups[ctx->connect_regs_idx] : NULL;
+            connect_fail(ctx, phase, grp, REASON_BLE);
+            return;
+        }
+        cancel_timeout(ctx);
+        router_mark_cooldown(&ctx->address);
+        ctx->disconnect_reason = NULL;   /* unsolicited-style: emits ble_link_loss */
+        ctx->state = LOGGER_DISCONNECTING;
+        sl_bt_connection_close(ctx->connection_handle);
         return;
     }
 
@@ -732,7 +973,7 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
 
     case LOGGER_DISCOVER_SERVICE:
         if (ctx->service_handle == 0) {
-            disconnect_with_error(ctx, "Service not found");
+            connect_fail(ctx, PHASE_BLE, NULL, REASON_BLE);
             return;
         }
         ctx->state = LOGGER_DISCOVER_CHARS;
@@ -742,7 +983,7 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
 
     case LOGGER_DISCOVER_CHARS:
         if (ctx->config_char_handle == 0 || ctx->data_char_handle == 0) {
-            disconnect_with_error(ctx, "Characteristics not found");
+            connect_fail(ctx, PHASE_BLE, NULL, REASON_BLE);
             return;
         }
         ctx->state = LOGGER_SUBSCRIBE_CONFIG;
@@ -760,27 +1001,20 @@ void router_on_procedure_completed(logger_ctx_t *ctx, uint16_t result)
 
     case LOGGER_SUBSCRIBE_DATA:
         cancel_timeout(ctx);
-        if (ctx->mode == LOGGER_MODE_FUOTA_LOGGER
-            || ctx->mode == LOGGER_MODE_FUOTA_SENSOR) {
-            // Pick the char handle the FUOTA session will target, then
-            // kick off the BLE Start JSON.
-            ctx->fuota_char_handle =
-                (ctx->mode == LOGGER_MODE_FUOTA_LOGGER)
-                    ? ctx->config_char_handle
-                    : ctx->data_char_handle;
-            fuota_send_start(ctx);
-            break;
-        }
-        // Serial was provided via the advert + admit flow, so skip the
-        // Type:9 read and go straight into FW version readback.
-        router_send_command(ctx, ctx->config_char_handle,
-                            "{\"Type\":10}", LOGGER_GET_FW_VERSION);
-        start_timeout(ctx, 60);
+        /* Subscriptions complete — begin the identify chain. */
+        identify_begin(ctx);
         break;
 
     default:
         break;
     }
+}
+
+static void identify_begin(logger_ctx_t *ctx)
+{
+    router_send_command(ctx, ctx->config_char_handle,
+                        "{\"Type\":10}", LOGGER_GET_FW_VERSION);
+    start_timeout(ctx, 60);
 }
 
 static void parse_string_value(const char *json, const char *key,
@@ -811,18 +1045,6 @@ static float parse_float_value(const char *json, const char *key)
     return result;
 }
 
-static float parse_telem_field(const char *telem, const char *key)
-{
-    char search[16];
-    snprintf(search, sizeof(search), "%s:", key);
-    const char *pos = strstr(telem, search);
-    if (!pos) return 0.0f;
-    pos += strlen(search);
-    float result = 0.0f;
-    sscanf(pos, "%f", &result);
-    return result;
-}
-
 static void parse_lvc22(logger_ctx_t *ctx, const char *json)
 {
     ctx->pc10_span      = parse_float_value(json, "sp");
@@ -831,67 +1053,78 @@ static void parse_lvc22(logger_ctx_t *ctx, const char *json)
     ctx->l_pc10_span    = parse_float_value(json, "l_sp");
     ctx->l_pc10_zero    = parse_float_value(json, "l_zr");
     ctx->atmo_pressure  = parse_float_value(json, "l_cal");
+    /* Best-effort: capture detec_offset_c per side if present in this reply
+     * so calibrate read-back has a value to emit. */
+    ctx->s_offset_c     = parse_float_value(json, "oc");
+    ctx->l_offset_c     = parse_float_value(json, "l_oc");
 }
 
-static void enter_calibrate_or_measure(logger_ctx_t *ctx)
+/* Kick the next CONNECT register read, or finish with >CONNECTED. */
+static void connect_send_next_regs_read(logger_ctx_t *ctx)
 {
-    if (ctx->calibrate_requested) {
-        char cal_cmd[64];
-        snprintf(cal_cmd, sizeof(cal_cmd),
-                 "{\"LVC\":15,\"Value\":%lu}", (unsigned long)ctx->host_atm_pa);
-        ctx->calibrate_requested = false;
-        router_send_command(ctx, ctx->data_char_handle,
-                            cal_cmd, LOGGER_CALIBRATE);
-        start_timeout(ctx, 30);
-    } else {
-        router_send_command(ctx, ctx->data_char_handle,
-                            "{\"LVC\":21}", LOGGER_TRIGGER_MEASURE);
-        start_timeout(ctx, 30);
+    if (ctx->connect_regs_idx >= CONNECT_REGS_COUNT) {
+        /* All four reads done → emit >CONNECTED and park. */
+        uart_output_connected(ctx);
+        ctx->fuota_rejoin_pending = false;
+        enter_session_idle(ctx);
+        return;
     }
+    char json[64];
+    snprintf(json, sizeof(json),
+             "{\"BTL\":\"Reg\",\"Req\":\"Read\",\"Grp\":\"%s\"}",
+             k_connect_groups[ctx->connect_regs_idx]);
+    router_send_command(ctx, ctx->config_char_handle, json, LOGGER_CONNECT_REGS);
+    start_timeout_ms(ctx, 1000);
+}
+
+static void enter_session_idle(logger_ctx_t *ctx)
+{
+    ctx->state = LOGGER_SESSION_IDLE;
+    cancel_timeout(ctx);
+    if (try_dispatch_regop(ctx)) return;
+    if (ctx->measure_active && !router_fuota_in_flight()) {
+        measure_kick_or_idle(ctx);
+    }
+}
+
+static void measure_kick_or_idle(logger_ctx_t *ctx)
+{
+    if (!ctx->measure_active || router_fuota_in_flight()) {
+        ctx->state = LOGGER_SESSION_IDLE;
+        return;
+    }
+    /* Drain any pending reg-op first. */
+    if (try_dispatch_regop(ctx)) return;
+
+    router_send_command(ctx, ctx->data_char_handle,
+                        "{\"LVC\":21}", LOGGER_TRIGGER_MEASURE);
+    start_timeout(ctx, 30);
 }
 
 void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
                             const uint8_t *payload, uint16_t payload_len)
 {
+    (void)characteristic;
     char json[RX_BUF_SIZE];
     uint16_t copy_len = (payload_len < RX_BUF_SIZE - 1) ? payload_len : RX_BUF_SIZE - 2;
     memcpy(json, payload, copy_len);
     json[copy_len] = '\0';
 
-    // Temporary diagnostic: dump every notification's first 80 chars + state
-    // + characteristic handle. Lets us see in the router trace whether the
-    // logger's Telem reply is reaching us at all after LVC:21 is sent.
-    {
-        char preview[81];
-        uint16_t n = copy_len < 80 ? copy_len : 80;
-        memcpy(preview, json, n);
-        preview[n] = '\0';
-        uart_output_log("NOTIFY ch=%u state=%d len=%u: %s",
-                        (unsigned)characteristic, (int)ctx->state,
-                        (unsigned)payload_len, preview);
-    }
-
     if (ctx->state == LOGGER_WRITE_PENDING) {
         return;
     }
 
-    // Logger emits {"DBG":"FUOTA:STATE"} trace packets during the sensor
-    // FUOTA Modbus phase. They're informational — log and ignore. Must run
-    // before cancel_timeout() so a DBG burst doesn't disarm a real
-    // request/response timer mid-flow.
+    /* Logger DBG packets — informational. */
     if (strstr(json, "\"DBG\":\"") != NULL) {
         char dbg[64] = {0};
         parse_string_value(json, "DBG", dbg, sizeof(dbg));
         uart_output_log("logger says: %s", dbg[0] ? dbg : json);
 
-        // During the post-reboot Modbus push, DBG packets are the keepalive
-        // heartbeat. Reset the 10 s keepalive window, but enforce the
-        // 120 s hard cap so a stuck-but-chattering logger can't run forever.
         if (ctx->state == LOGGER_FUOTA_POST_REBOOT_WAIT) {
             int32_t over = (int32_t)(xTaskGetTickCount()
                           - ctx->fuota_reboot_hard_deadline_tick);
             if (over >= 0) {
-                fuota_abort(ctx, "reboot", -1, "HardLimit");
+                fuota_abort(ctx, PHASE_REBOOT, -1, REASON_TIMEOUT);
                 return;
             }
             cancel_timeout(ctx);
@@ -913,13 +1146,18 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
     case LOGGER_GET_SNS_FW:
         parse_string_value(json, "Value", ctx->sns_fw_version, SNS_FW_MAX);
         router_send_command(ctx, ctx->data_char_handle,
+                            "{\"Type\":70,\"Dir\":\"get\"}", LOGGER_GET_SNS_SERIAL);
+        start_timeout(ctx, 60);
+        break;
+
+    case LOGGER_GET_SNS_SERIAL:
+        parse_string_value(json, "Value", ctx->sns_serial, SNS_SERIAL_MAX);
+        router_send_command(ctx, ctx->data_char_handle,
                             "{\"Type\":74,\"Dir\":\"get\"}", LOGGER_GET_PC10_ZERO);
         start_timeout(ctx, 60);
         break;
 
     case LOGGER_GET_PC10_ZERO:
-        // Type:74/75 are the LOGGER's PC10 zero/span (on-board, atmospheric).
-        // Sensor-side zero/span are filled in by the LVC:22 prime below.
         ctx->l_pc10_zero = parse_float_value(json, "Value") / 100.0f;
         router_send_command(ctx, ctx->data_char_handle,
                             "{\"Type\":75,\"Dir\":\"get\"}", LOGGER_GET_PC10_SPAN);
@@ -928,8 +1166,6 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
 
     case LOGGER_GET_PC10_SPAN:
         ctx->l_pc10_span = parse_float_value(json, "Value") / 100.0f;
-        // Defer >IDENT until after LVC:22 so we can publish both
-        // sensor (s_*) and logger (l_*) zero/span pairs in one line.
         router_send_command(ctx, ctx->data_char_handle,
                             "{\"LVC\":22}", LOGGER_PRIME_PRESSURE);
         start_timeout(ctx, 10);
@@ -941,95 +1177,134 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             break;
         }
         parse_lvc22(ctx, json);
-        uart_output_ident(ctx);
-        enter_calibrate_or_measure(ctx);
+        /* Identify complete → run the 4 canonical register-group reads. */
+        ctx->connect_regs_idx = 0;
+        ctx->state = LOGGER_CONNECT_REGS;
+        connect_send_next_regs_read(ctx);
         break;
+
+    case LOGGER_CONNECT_REGS: {
+        /* Expect a BTL Reg/Read response on the canonical group. */
+        if (!strstr(json, "\"BTL\":\"Reg\"")
+         || !strstr(json, "\"Rsp\":\"Read\"")) {
+            start_timeout_ms(ctx, 500);
+            break;
+        }
+        const char *grp = k_connect_groups[ctx->connect_regs_idx];
+        char gotgrp[REGOP_GROUP_BUF] = {0};
+        parse_string_value(json, "Grp", gotgrp, sizeof(gotgrp));
+        if (strcmp(gotgrp, grp) != 0) {
+            start_timeout_ms(ctx, 500);
+            break;
+        }
+        if (!strstr(json, "\"Ok\":1")) {
+            char err[32] = {0};
+            parse_string_value(json, "Err", err, sizeof(err));
+            connect_fail(ctx, PHASE_READREGS, grp,
+                         err[0] ? err : REASON_UNKNOWN_GROUP);
+            break;
+        }
+        static char blob[REGOP_BLOB_BUF];
+        blob[0] = '\0';
+        parse_string_value(json, "Data", blob, sizeof(blob));
+        uart_output_regs_blob(ctx->serial, grp, blob);
+        ctx->connect_regs_idx++;
+        connect_send_next_regs_read(ctx);
+        break;
+    }
 
     case LOGGER_CALIBRATE:
         uart_output_log("Calibrate rsp %s: %s", ctx->serial, json);
-        // Logger needs a few seconds to settle after calibration before it
-        // will respond to LVC:21 — hold here and let the soft timer fire
-        // the measure trigger from router_on_timer_expired.
+        /* Logger needs a few seconds to settle. Then read back the new
+         * detec_offset_c values via LVC:22 so we can emit >CAL. */
         ctx->state = LOGGER_CALIBRATE_SETTLE;
         start_timeout(ctx, 5);
         break;
 
-    case LOGGER_TRIGGER_MEASURE: {
-        // LVC:21 causes the logger to emit one or more ack/status frames
-        // before the actual Telem payload. Only advance once we see the
-        // Telem field — otherwise we'd fire LVC:0 prematurely and drift
-        // out of request/response sync with the logger's queue.
-        char *telem = strstr(json, "\"Telem\":\"");
-        if (!telem) {
-            start_timeout(ctx, 30);
-            break;
-        }
-        telem += 9;
-        ctx->flow           = parse_telem_field(telem, "Fr");
-        ctx->velocity       = parse_telem_field(telem, "Vl");
-        ctx->level          = parse_telem_field(telem, "Lv");
-        ctx->temperature    = parse_telem_field(telem, "Wt");
-        ctx->atmo_pressure  = parse_telem_field(telem, "atm");
-        ctx->water_pressure = parse_telem_field(telem, "Wpr");
-        router_send_command(ctx, ctx->data_char_handle,
-                            "{\"LVC\":22}", LOGGER_READ_PRESSURE_BLOCK);
-        start_timeout(ctx, 10);
-        break;
-    }
-
-    case LOGGER_READ_PRESSURE_BLOCK:
-        // Ignore stray frames — the real LVC:22 reply carries "cal".
+    case LOGGER_CALIBRATE_READBACK:
         if (!strstr(json, "\"cal\":")) {
             start_timeout(ctx, 10);
             break;
         }
         parse_lvc22(ctx, json);
-        router_send_command(ctx, ctx->data_char_handle,
-                            "{\"LVC\":0}", LOGGER_READ_BATTERY);
-        start_timeout(ctx, 10);
+        uart_output_cal(ctx->serial, ctx->l_offset_c, ctx->s_offset_c);
+        enter_session_idle(ctx);
         break;
 
-    case LOGGER_READ_BATTERY:
-        // Discriminate against stray Telem/status frames — only act on the
-        // actual battery reply (top-level "Value", no "Telem").
-        if (strstr(json, "\"Telem\":\"") || !strstr(json, "\"Value\":")) {
-            start_timeout(ctx, 10);
+    case LOGGER_WIPE_SENT:
+        /* SF:9 reply is {"Type":22,"Value":"OK"}. Ignore any other frame
+         * and keep waiting until the timeout fires. */
+        if (!strstr(json, "\"Type\":22") || !strstr(json, "\"Value\":\"OK\"")) {
             break;
         }
-        ctx->battery_voltage = parse_float_value(json, "Value");
-        uart_output_result(ctx);
+        uart_output_ack("wipemodbus", ctx->serial, NULL);
+        enter_session_idle(ctx);
+        break;
 
-        if (ctx->repeat_measure) {
-            // Hold connection, pace the loop so we don't hammer the logger
-            // at hundreds of ms per cycle. Timer fires LVC:21 from
-            // router_on_timer_expired (same pattern as CALIBRATE_SETTLE).
+    case LOGGER_TRIGGER_MEASURE: {
+        /* LVC:21 triggers a fresh sensor reading. We don't care about the
+         * Telem payload — the canonical truth lives in the `outputs`
+         * register group, which we read next. Just gate on Telem arriving
+         * so we know the sensor has actually run. */
+        if (!strstr(json, "\"Telem\":\"")) {
+            start_timeout(ctx, 30);
+            break;
+        }
+        router_send_command(ctx, ctx->config_char_handle,
+                            "{\"BTL\":\"Reg\",\"Req\":\"Read\",\"Grp\":\"outputs\"}",
+                            LOGGER_MEASURE_READ_OUTPUTS);
+        start_timeout_ms(ctx, 1000);
+        break;
+    }
+
+    case LOGGER_MEASURE_READ_OUTPUTS: {
+        if (!strstr(json, "\"BTL\":\"Reg\"")
+         || !strstr(json, "\"Rsp\":\"Read\"")) {
+            start_timeout_ms(ctx, 500);
+            break;
+        }
+        char grp[REGOP_GROUP_BUF] = {0};
+        parse_string_value(json, "Grp", grp, sizeof(grp));
+        if (strcmp(grp, "outputs") != 0) {
+            start_timeout_ms(ctx, 500);
+            break;
+        }
+        if (strstr(json, "\"Ok\":1") != NULL) {
+            static char blob[REGOP_BLOB_BUF];
+            blob[0] = '\0';
+            parse_string_value(json, "Data", blob, sizeof(blob));
+            uart_output_results(ctx->serial, blob);
+        } else {
+            /* Logger rejected the read — log and skip this cycle so the
+             * measure loop keeps ticking. */
+            char err[32] = {0};
+            parse_string_value(json, "Err", err, sizeof(err));
+            uart_output_log("outputs read err [%s]: %s",
+                            ctx->serial, err[0] ? err : "?");
+        }
+
+        if (ctx->measure_stop_pending) {
+            ctx->measure_stop_pending = false;
+            ctx->measure_active = false;
+        }
+        if (ctx->measure_active && !router_fuota_in_flight()) {
             ctx->rx_len = 0;
             ctx->state = LOGGER_MEASURE_WAIT;
-            // If the host queued a reg op during the measure cycle, drain it
-            // here in place of the 5 s pace timer — measure resumes after.
-            if (try_dispatch_regop(ctx)) {
-                break;
-            }
+            if (try_dispatch_regop(ctx)) break;
             start_timeout(ctx, 5);
         } else {
-            router_mark_cooldown(&ctx->address);
-            ctx->state = LOGGER_DISCONNECTING;
-            sl_bt_connection_close(ctx->connection_handle);
+            enter_session_idle(ctx);
         }
         break;
+    }
 
     case LOGGER_FUOTA_START_SENT: {
         char err[32] = {0};
         if (parse_btl_result(json, err, sizeof(err))) {
-            uart_output_fuota_ready(ctx->serial);
-            // Bootloader erases the target slot after Ack — flash erase on
-            // the device takes ~5 s. Hold off the first chunk so the host
-            // doesn't start streaming into a busy bootloader. Soft timer
-            // transitions to AWAIT_CHUNK in router_on_timer_expired.
             ctx->state = LOGGER_FUOTA_ERASE_WAIT;
             start_timeout(ctx, 7);
         } else {
-            fuota_abort(ctx, "start", -1, err[0] ? err : "Nack");
+            fuota_abort(ctx, PHASE_START, -1, err[0] ? err : REASON_NACK);
         }
         break;
     }
@@ -1037,18 +1312,14 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
     case LOGGER_FUOTA_CHUNK_SENT: {
         char err[32] = {0};
         if (!parse_btl_result(json, err, sizeof(err))) {
-            fuota_abort(ctx, "chunk", (int32_t)ctx->fuota_seq,
-                        err[0] ? err : "Nack");
+            fuota_abort(ctx, PHASE_CHUNK, (int32_t)ctx->fuota_seq,
+                        err[0] ? err : REASON_NACK);
             break;
         }
         ctx->fuota_sent_bytes += ctx->fuota_chunk_data_len;
         ctx->fuota_seq++;
         ctx->fuota_chunk_data_len = 0;
         if (ctx->fuota_sent_bytes >= ctx->fuota_total_bytes) {
-            uart_output_log("FUOTA image crc32=0x%08lX total=%lu",
-                            (unsigned long)(ctx->fuota_crc32 ^ 0xFFFFFFFFu),
-                            (unsigned long)ctx->fuota_total_bytes);
-            uart_output_fuota_verifying(ctx->serial);
             fuota_send_verify(ctx);
         } else {
             ctx->state = LOGGER_FUOTA_AWAIT_CHUNK;
@@ -1056,7 +1327,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             uint16_t next = (remaining < ctx->fuota_max_payload)
                 ? (uint16_t)remaining
                 : ctx->fuota_max_payload;
-            uart_output_fuota_next(ctx->serial, ctx->fuota_seq, next);
+            uart_output_fuota_next(ctx->serial, next);
             start_timeout(ctx, 30);
         }
         break;
@@ -1065,10 +1336,9 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
     case LOGGER_FUOTA_VERIFY_SENT: {
         char err[32] = {0};
         if (parse_btl_result(json, err, sizeof(err))) {
-            uart_output_fuota_verified(ctx->serial);
             fuota_send_reboot(ctx);
         } else {
-            fuota_abort(ctx, "verify", -1, err[0] ? err : "Nack");
+            fuota_abort(ctx, PHASE_VERIFY, -1, err[0] ? err : REASON_NACK);
         }
         break;
     }
@@ -1076,53 +1346,65 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
     case LOGGER_FUOTA_REBOOT_SENT: {
         char err[32] = {0};
         if (!parse_btl_result(json, err, sizeof(err))) {
-            fuota_abort(ctx, "reboot", -1, err[0] ? err : "Nack");
+            /* DEBUG: dump the exact frame that the router treats as a
+             * non-Ack reboot response, so we can see what the logger
+             * actually sends after CLOSE_DOWN. Text first, then hex in
+             * case it is binary or has stray whitespace/case. */
+            char hex[3 * 48 + 1];
+            uint16_t hn = (payload_len < 48) ? payload_len : 48;
+            for (uint16_t i = 0; i < hn; i++) {
+                static const char HEXD[] = "0123456789abcdef";
+                hex[i * 3 + 0] = HEXD[(payload[i] >> 4) & 0xF];
+                hex[i * 3 + 1] = HEXD[payload[i] & 0xF];
+                hex[i * 3 + 2] = ' ';
+            }
+            hex[hn * 3] = '\0';
+            uart_output_log("reboot rsp raw len=%u text=[%s]",
+                            (unsigned)payload_len, json);
+            uart_output_log("reboot rsp raw hex=[%s]", hex);
+            fuota_abort(ctx, PHASE_REBOOT, -1, err[0] ? err : REASON_NACK);
             break;
         }
-        uart_output_fuota_rebooting(ctx->serial);
         if (ctx->mode == LOGGER_MODE_FUOTA_LOGGER) {
-            // Logger-mode reboot: the logger will reboot into its own bootloader
-            // immediately. Disconnect and we're done.
+            /* Logger reboots into bootloader → BLE drops. Mark slot for
+             * rejoin so on_disconnected reopens BLE and re-runs CONNECT. */
             cancel_timeout(ctx);
+            ctx->fuota_rejoin_pending = true;
+            ctx->disconnect_reason = NULL;  /* suppress >DISCONNECTED */
             ctx->state = LOGGER_DISCONNECTING;
             sl_bt_connection_close(ctx->connection_handle);
             break;
         }
-        // Sensor-mode reboot: the logger now spends 30-90 s pushing firmware
-        // to the sensor over Modbus, emitting DBG keepalive packets. Hold
-        // the connection open and wait for the final BTL Ack/Nack.
+        /* Sensor mode: connection stays open while logger pushes to sensor. */
         ctx->state = LOGGER_FUOTA_POST_REBOOT_WAIT;
-        start_timeout(ctx, 10);   // keepalive window
+        ctx->fuota_reboot_hard_deadline_tick =
+            xTaskGetTickCount() + (120u * configTICK_RATE_HZ);
+        start_timeout(ctx, 10);
         break;
     }
 
     case LOGGER_REGOP_READ: {
-        // Verify shape: {"BTL":"Reg","Rsp":"Read","Grp":"<grp>",...}
         if (!strstr(json, "\"BTL\":\"Reg\"")
          || !strstr(json, "\"Rsp\":\"Read\"")) {
-            // Stray frame on the data channel — re-arm and wait.
             start_timeout_ms(ctx, 500);
             break;
         }
         char grp[REGOP_GROUP_BUF] = {0};
         parse_string_value(json, "Grp", grp, sizeof(grp));
         if (strcmp(grp, ctx->regop_group) != 0) {
-            // Wrong group response — treat as stray, keep waiting.
             start_timeout_ms(ctx, 500);
             break;
         }
         if (strstr(json, "\"Ok\":1") != NULL) {
-            // Static: kept off the 2 KB BT-event-task stack. Safe because
-            // router_on_notification is invoked only on that single thread.
             static char blob[REGOP_BLOB_BUF];
             blob[0] = '\0';
             parse_string_value(json, "Data", blob, sizeof(blob));
-            uart_output_regs(ctx->serial, ctx->regop_group, blob);
+            uart_output_regs_blob(ctx->serial, ctx->regop_group, blob);
             regop_complete(ctx);
         } else {
             char err[32] = {0};
             parse_string_value(json, "Err", err, sizeof(err));
-            regop_fail(ctx, "readregs", err[0] ? err : "logger err");
+            regop_fail(ctx, "readregs", err[0] ? err : REASON_UNKNOWN_GROUP);
         }
         break;
     }
@@ -1133,16 +1415,14 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             start_timeout_ms(ctx, 500);
             break;
         }
-        bool ok = (strstr(json, "\"Ok\":1") != NULL);
-        if (ok) {
-            uart_output_writeack(ctx->serial, ctx->regop_group,
-                                 ctx->regop_key, true, NULL);
+        if (strstr(json, "\"Ok\":1") != NULL) {
+            uart_output_regs_write_ok(ctx->serial, ctx->regop_group,
+                                      ctx->regop_key);
         } else {
             char err[32] = {0};
             parse_string_value(json, "Err", err, sizeof(err));
-            uart_output_writeack(ctx->serial, ctx->regop_group,
-                                 ctx->regop_key, false,
-                                 err[0] ? err : "logger err");
+            uart_output_err("writereg", ctx->serial,
+                            err[0] ? err : REASON_NACK);
         }
         regop_complete(ctx);
         break;
@@ -1154,14 +1434,13 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             start_timeout_ms(ctx, 500);
             break;
         }
-        bool ok = (strstr(json, "\"Ok\":1") != NULL);
-        if (ok) {
-            uart_output_commitack(ctx->serial, true, NULL);
+        if (strstr(json, "\"Ok\":1") != NULL) {
+            uart_output_regs_op_ok(ctx->serial, "commit");
         } else {
             char err[32] = {0};
             parse_string_value(json, "Err", err, sizeof(err));
-            uart_output_commitack(ctx->serial, false,
-                                  err[0] ? err : "logger err");
+            uart_output_err("commitregs", ctx->serial,
+                            err[0] ? err : REASON_NACK);
         }
         regop_complete(ctx);
         break;
@@ -1173,37 +1452,49 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
             start_timeout_ms(ctx, 500);
             break;
         }
-        bool ok = (strstr(json, "\"Ok\":1") != NULL);
-        if (ok) {
-            uart_output_defaultack(ctx->serial, true, NULL);
+        if (strstr(json, "\"Ok\":1") != NULL) {
+            uart_output_regs_op_ok(ctx->serial, "default");
         } else {
             char err[32] = {0};
             parse_string_value(json, "Err", err, sizeof(err));
-            uart_output_defaultack(ctx->serial, false,
-                                   err[0] ? err : "logger err");
+            uart_output_err("defaultregs", ctx->serial,
+                            err[0] ? err : REASON_NACK);
         }
         regop_complete(ctx);
         break;
     }
 
     case LOGGER_FUOTA_POST_REBOOT_WAIT: {
-        // Only the final BTL Ack or Nack ends this phase. Anything else
-        // (e.g. a stray frame that slipped past the DBG filter) — ignore
-        // and keep waiting; DBG packets handle keepalive separately above.
+        /* DEBUG: dump every non-DBG frame seen during the sensor reboot
+         * wait, so we can see exactly what carries the Nack after the
+         * CPI update completes. Text first, then hex for binary/whitespace. */
+        {
+            char hex[3 * 48 + 1];
+            uint16_t hn = (payload_len < 48) ? payload_len : 48;
+            for (uint16_t i = 0; i < hn; i++) {
+                static const char HEXD[] = "0123456789abcdef";
+                hex[i * 3 + 0] = HEXD[(payload[i] >> 4) & 0xF];
+                hex[i * 3 + 1] = HEXD[payload[i] & 0xF];
+                hex[i * 3 + 2] = ' ';
+            }
+            hex[hn * 3] = '\0';
+            uart_output_log("post-reboot frame len=%u text=[%s]",
+                            (unsigned)payload_len, json);
+            uart_output_log("post-reboot frame hex=[%s]", hex);
+        }
         if (strstr(json, "\"BTL\":\"Ack\"") != NULL) {
             cancel_timeout(ctx);
-            uart_output_fuota_result(ctx->serial, true, 0);
-            ctx->state = LOGGER_DISCONNECTING;
-            sl_bt_connection_close(ctx->connection_handle);
+            /* Sensor FUOTA done; link still open. Re-run identify + 4 reads
+             * → fresh >CONNECTED on the same slot. */
+            ctx->fuota_rejoin_pending = true;
+            ctx->mode = LOGGER_MODE_MEASURE;
+            identify_begin(ctx);
         } else if (strstr(json, "\"BTL\":\"Nack\"") != NULL) {
             cancel_timeout(ctx);
-            int code = (int)parse_float_value(json, "Code");
-            uart_output_fuota_result(ctx->serial, false, code);
-            router_mark_cooldown(&ctx->address);
-            ctx->state = LOGGER_DISCONNECTING;
-            sl_bt_connection_close(ctx->connection_handle);
+            char err[32] = {0};
+            parse_btl_result(json, err, sizeof(err));
+            fuota_abort(ctx, PHASE_REBOOT, -1, err[0] ? err : REASON_NACK);
         } else {
-            // Stray frame — re-arm keepalive so we don't disarm the watchdog.
             start_timeout(ctx, 10);
         }
         break;
@@ -1216,10 +1507,16 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
 
 void router_on_timer_expired(logger_ctx_t *ctx)
 {
-    if (ctx->state == LOGGER_CALIBRATE_SETTLE
-        || ctx->state == LOGGER_MEASURE_WAIT) {
-        // Drain any pending reg op before kicking the next measure cycle.
-        if (try_dispatch_regop(ctx)) {
+    if (ctx->state == LOGGER_CALIBRATE_SETTLE) {
+        router_send_command(ctx, ctx->data_char_handle,
+                            "{\"LVC\":22}", LOGGER_CALIBRATE_READBACK);
+        start_timeout(ctx, 10);
+        return;
+    }
+    if (ctx->state == LOGGER_MEASURE_WAIT) {
+        if (try_dispatch_regop(ctx)) return;
+        if (!ctx->measure_active || router_fuota_in_flight()) {
+            enter_session_idle(ctx);
             return;
         }
         router_send_command(ctx, ctx->data_char_handle,
@@ -1234,113 +1531,85 @@ void router_on_timer_expired(logger_ctx_t *ctx)
         if (ctx->regop_retries == 0) {
             ctx->regop_retries = 1;
             switch (ctx->state) {
-            case LOGGER_REGOP_READ:
-                send_regop_read(ctx, ctx->regop_group, LOGGER_REGOP_READ);
-                break;
-            case LOGGER_REGOP_WRITE:
-                send_regop_write(ctx);
-                break;
-            case LOGGER_REGOP_COMMIT:
-                send_regop_commit(ctx);
-                break;
-            case LOGGER_REGOP_DEFAULT:
-                send_regop_default(ctx);
-                break;
-            default:
-                break;
+            case LOGGER_REGOP_READ:    send_regop_read(ctx, ctx->regop_group, LOGGER_REGOP_READ); break;
+            case LOGGER_REGOP_WRITE:   send_regop_write(ctx); break;
+            case LOGGER_REGOP_COMMIT:  send_regop_commit(ctx); break;
+            case LOGGER_REGOP_DEFAULT: send_regop_default(ctx); break;
+            default: break;
             }
         } else {
-            regop_fail(ctx, regop_cmd_name(ctx->regop_pending),
-                       "logger no response");
+            regop_fail(ctx, regop_cmd_name(ctx->regop_pending), REASON_TIMEOUT);
         }
         return;
     }
     if (ctx->state == LOGGER_FUOTA_ERASE_WAIT) {
-        // Bootloader erase settle window expired — now safe to ask the host
-        // for the first chunk.
         ctx->state = LOGGER_FUOTA_AWAIT_CHUNK;
         uint16_t first = (ctx->fuota_total_bytes < ctx->fuota_max_payload)
             ? (uint16_t)ctx->fuota_total_bytes
             : ctx->fuota_max_payload;
-        uart_output_fuota_next(ctx->serial, ctx->fuota_seq, first);
+        uart_output_fuota_next(ctx->serial, first);
         start_timeout(ctx, 30);
         return;
     }
     if (ctx->state == LOGGER_FUOTA_POST_REBOOT_WAIT) {
-        // Sliding keepalive watchdog: timer only fires if no DBG packet has
-        // arrived for 10 s. Distinguish "logger went silent" from "logger
-        // is chattering but stuck" via the hard deadline.
         int32_t over = (int32_t)(xTaskGetTickCount()
                       - ctx->fuota_reboot_hard_deadline_tick);
-        const char *reason = (over >= 0)
-            ? "HardLimit (120s)"
-            : "no DBG keepalive for 10s";
-        fuota_abort(ctx, "reboot", -1, reason);
+        (void)over;
+        fuota_abort(ctx, PHASE_REBOOT, -1, REASON_TIMEOUT);
         return;
     }
-    if (ctx->state == LOGGER_FUOTA_START_SENT
-        || ctx->state == LOGGER_FUOTA_AWAIT_CHUNK
-        || ctx->state == LOGGER_FUOTA_CHUNK_SENT
-        || ctx->state == LOGGER_FUOTA_VERIFY_SENT
-        || ctx->state == LOGGER_FUOTA_REBOOT_SENT) {
+    if (state_is_fuota(ctx->state)) {
         const char *phase =
-            (ctx->state == LOGGER_FUOTA_START_SENT)  ? "start"  :
-            (ctx->state == LOGGER_FUOTA_VERIFY_SENT) ? "verify" :
-            (ctx->state == LOGGER_FUOTA_REBOOT_SENT) ? "reboot" : "chunk";
+            (ctx->state == LOGGER_FUOTA_START_SENT)  ? PHASE_START :
+            (ctx->state == LOGGER_FUOTA_VERIFY_SENT) ? PHASE_VERIFY :
+            (ctx->state == LOGGER_FUOTA_REBOOT_SENT) ? PHASE_REBOOT : PHASE_CHUNK;
         int32_t seq = (ctx->state == LOGGER_FUOTA_CHUNK_SENT
                        || ctx->state == LOGGER_FUOTA_AWAIT_CHUNK)
                       ? (int32_t)ctx->fuota_seq : -1;
-        if (ctx->state == LOGGER_FUOTA_AWAIT_CHUNK) {
-            uint32_t remaining = ctx->fuota_total_bytes - ctx->fuota_sent_bytes;
-            uint16_t want = (remaining < ctx->fuota_max_payload)
-                            ? (uint16_t)remaining : ctx->fuota_max_payload;
-            uart_output_log("FUOTA await-chunk timeout seq=%u got=%u/%u "
-                            "sent=%lu/%lu",
-                            (unsigned)ctx->fuota_seq,
-                            (unsigned)ctx->fuota_chunk_data_len,
-                            (unsigned)want,
-                            (unsigned long)ctx->fuota_sent_bytes,
-                            (unsigned long)ctx->fuota_total_bytes);
-            const uint8_t *p = &ctx->fuota_chunk_buf[OB2PACKET_HEAD_SIZE + 2];
-            uint16_t n = ctx->fuota_chunk_data_len;
-            // Dump all received bytes as hex, 32 bytes per #LOG line,
-            // prefixed by the byte offset so dropped-byte patterns are
-            // easy to spot in the transcript.
-            char line[3 * 32 + 1];
-            for (uint16_t off = 0; off < n; off += 32) {
-                uint16_t chunk = (n - off < 32) ? (n - off) : 32;
-                for (uint16_t i = 0; i < chunk; i++) {
-                    static const char hex[] = "0123456789ABCDEF";
-                    line[i * 3 + 0] = hex[p[off + i] >> 4];
-                    line[i * 3 + 1] = hex[p[off + i] & 0x0F];
-                    line[i * 3 + 2] = ' ';
-                }
-                line[chunk * 3 - 1] = '\0';
-                uart_output_log("FUOTA rx @%03u: %s", (unsigned)off, line);
-            }
-        } else if (ctx->state == LOGGER_FUOTA_CHUNK_SENT) {
-            uart_output_log("FUOTA chunk-sent timeout seq=%u "
-                            "(no BTL ack from device) sent=%lu/%lu",
-                            (unsigned)ctx->fuota_seq,
-                            (unsigned long)ctx->fuota_sent_bytes,
-                            (unsigned long)ctx->fuota_total_bytes);
-        }
-        fuota_abort(ctx, phase, seq, "Timeout");
+        fuota_abort(ctx, phase, seq, REASON_TIMEOUT);
+        return;
+    }
+    if (ctx->state == LOGGER_WIPE_SENT) {
+        uart_output_err("wipemodbus", ctx->serial, REASON_TIMEOUT);
+        enter_session_idle(ctx);
+        return;
+    }
+    if (ctx->state == LOGGER_CONNECTING
+     || ctx->state == LOGGER_DISCOVER_SERVICE
+     || ctx->state == LOGGER_DISCOVER_CHARS
+     || ctx->state == LOGGER_SUBSCRIBE_CONFIG
+     || ctx->state == LOGGER_SUBSCRIBE_DATA) {
+        connect_fail(ctx, PHASE_BLE, NULL, REASON_TIMEOUT);
+        return;
+    }
+    if (ctx->state == LOGGER_GET_FW_VERSION
+     || ctx->state == LOGGER_GET_SNS_FW
+     || ctx->state == LOGGER_GET_PC10_ZERO
+     || ctx->state == LOGGER_GET_PC10_SPAN
+     || ctx->state == LOGGER_PRIME_PRESSURE) {
+        connect_fail(ctx, PHASE_IDENTIFY, NULL, REASON_TIMEOUT);
+        return;
+    }
+    if (ctx->state == LOGGER_CONNECT_REGS) {
+        const char *grp = (ctx->connect_regs_idx < CONNECT_REGS_COUNT)
+                          ? k_connect_groups[ctx->connect_regs_idx] : NULL;
+        connect_fail(ctx, PHASE_READREGS, grp, REASON_TIMEOUT);
         return;
     }
     uart_output_log("Timeout in state %d", ctx->state);
-    disconnect_with_error(ctx, "Timeout");
+    cancel_timeout(ctx);
+    router_mark_cooldown(&ctx->address);
+    ctx->disconnect_reason = NULL;
+    ctx->state = LOGGER_DISCONNECTING;
+    sl_bt_connection_close(ctx->connection_handle);
 }
 
-// ============================================================================
-// FUOTA helpers
-// ============================================================================
+/* ============================================================================
+ * FUOTA helpers
+ * ============================================================================ */
 
 static bool parse_btl_result(const char *json, char *err_out, size_t err_len)
 {
-    // Treat anything containing "BTL":"Ack" as success (regardless of extra
-    // fields such as Result:"OK"). Anything else with "BTL":"Nack" is a
-    // failure — copy the Error string if present.
     if (strstr(json, "\"BTL\":\"Ack\"") != NULL) {
         return true;
     }
@@ -1361,9 +1630,6 @@ static bool parse_btl_result(const char *json, char *err_out, size_t err_len)
     return false;
 }
 
-// CRC32 (IEEE 802.3, reflected, poly 0xEDB88320), bitwise — small & table-free.
-// Caller passes running state in/out (seed with 0xFFFFFFFF, final-XOR with
-// 0xFFFFFFFF once at the end). Python: zlib.crc32(data) matches this.
 static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -1391,23 +1657,14 @@ static const char *fuota_reboot_json(logger_mode_t mode)
 
 static void fuota_send_start(logger_ctx_t *ctx)
 {
-    // GATT write max = ATT_MTU - 3. OB2 framing adds 7 bytes around the raw
-    // image payload (3 head + 2 seq + 2 tail CRC). Cap fuota_max_payload so
-    // the on-wire pkt_len never exceeds the negotiated MTU.
     if (ctx->att_mtu >= 3 + 7 + 4) {
         uint16_t gatt_max = (uint16_t)(ctx->att_mtu - 3);
         uint16_t payload_max = (uint16_t)(gatt_max - 7);
-        // Device bootloader writes chunks straight to flash; flash word
-        // writes require 4-byte alignment, so keep each payload a multiple
-        // of 4 so the running offset stays aligned across chunks.
         payload_max &= (uint16_t)~0x03u;
         if (payload_max < ctx->fuota_max_payload) {
             ctx->fuota_max_payload = (uint8_t)payload_max;
         }
     }
-    uart_output_log("FUOTA session mtu=%u payload=%u",
-                    (unsigned)ctx->att_mtu,
-                    (unsigned)ctx->fuota_max_payload);
     router_send_command(ctx, ctx->fuota_char_handle,
                         fuota_start_json(ctx->mode), LOGGER_FUOTA_START_SENT);
     start_timeout(ctx, 15);
@@ -1415,7 +1672,6 @@ static void fuota_send_start(logger_ctx_t *ctx)
 
 static void fuota_send_verify(logger_ctx_t *ctx)
 {
-    // Empty-payload binary frame: STX, TYPE, LENGTH=5, CRC_H, CRC_L.
     uint8_t pkt[OB2PACKET_HEADANDTAIL_SIZE];
     pkt[1] = ctx->fuota_chunk_type;
     size_t pkt_len = ob2packet_makepacket_inplace(pkt, OB2PACKET_HEAD_SIZE);
@@ -1430,17 +1686,8 @@ static void fuota_send_verify(logger_ctx_t *ctx)
 
 static void fuota_send_reboot(logger_ctx_t *ctx)
 {
-    // After reboot, the logger spends 30-90 s pushing firmware to the
-    // sensor over Modbus. DBG trace packets act as a keepalive heartbeat
-    // (~30 Hz during PROG), with two ~5 s silent gaps for ERASE and
-    // ERASE_SETTLE. 10 s keepalive comfortably tolerates those gaps;
-    // 120 s hard deadline caps the worst case.
     ctx->fuota_reboot_hard_deadline_tick =
         xTaskGetTickCount() + (120u * configTICK_RATE_HZ);
-    // Sensor FUOTA: logger holds the BLE link, streams DBG keepalives while
-    // it Modbus-pushes the image, then emits a final BTL Ack/Nack — wait
-    // for that outcome in POST_REBOOT_WAIT. Logger FUOTA: bootloader install
-    // runs after disconnect, so the immediate-Ack-then-close path stands.
     logger_state_t target = (ctx->mode == LOGGER_MODE_FUOTA_SENSOR)
         ? LOGGER_FUOTA_POST_REBOOT_WAIT
         : LOGGER_FUOTA_REBOOT_SENT;
@@ -1455,6 +1702,8 @@ static void fuota_abort(logger_ctx_t *ctx, const char *phase,
     uart_output_fuota_err(ctx->serial, phase, seq, reason);
     cancel_timeout(ctx);
     router_mark_cooldown(&ctx->address);
+    ctx->fuota_rejoin_pending = false;
+    ctx->disconnect_reason = REASON_FUOTA_ERR;
     ctx->state = LOGGER_DISCONNECTING;
     sl_bt_connection_close(ctx->connection_handle);
 }
@@ -1464,7 +1713,7 @@ uint16_t router_fuota_next_expected_bytes(logger_ctx_t **out_ctx)
     for (int i = 0; i < MAX_LOGGERS; i++) {
         logger_ctx_t *ctx = &loggers[i];
         if (ctx->state != LOGGER_FUOTA_AWAIT_CHUNK) continue;
-        if (ctx->fuota_chunk_ready) continue;   // CLI task already filled it
+        if (ctx->fuota_chunk_ready) continue;
         uint32_t remaining = ctx->fuota_total_bytes - ctx->fuota_sent_bytes;
         uint16_t next = (remaining < ctx->fuota_max_payload)
             ? (uint16_t)remaining
@@ -1476,9 +1725,9 @@ uint16_t router_fuota_next_expected_bytes(logger_ctx_t **out_ctx)
     return 0;
 }
 
-// ============================================================================
-// Modbus register editor — JSON senders & completion helpers
-// ============================================================================
+/* ============================================================================
+ * Reg-op JSON senders + completion
+ * ============================================================================ */
 
 static const char *regop_cmd_name(regop_kind_t k)
 {
@@ -1491,10 +1740,6 @@ static const char *regop_cmd_name(regop_kind_t k)
     }
 }
 
-// Reg-op JSON traffic goes on the config characteristic (ec4a32a9-...).
-// The data characteristic just forwards bytes via ipc_print on the single-MCU
-// logger and never reaches the BTL dispatcher — see logger app.c:678-727.
-// FUOTA-logger already uses this characteristic, so the path is proven.
 static void send_regop_read(logger_ctx_t *ctx, const char *grp,
                             logger_state_t next)
 {
@@ -1535,30 +1780,19 @@ static void send_regop_default(logger_ctx_t *ctx)
 static bool try_dispatch_regop(logger_ctx_t *ctx)
 {
     if (ctx->regop_pending == REGOP_NONE) return false;
-    // Only safe to dispatch from idle-ish states. OUTPUT_RESULT is the
-    // moment after >RESULT emission, MEASURE_WAIT is the 5 s pacing window.
+    /* Safe idle states: SESSION_IDLE, or measure-cycle idle (MEASURE_WAIT). */
     if (ctx->state != LOGGER_MEASURE_WAIT
-     && ctx->state != LOGGER_OUTPUT_RESULT) {
+     && ctx->state != LOGGER_SESSION_IDLE) {
         return false;
     }
     cancel_timeout(ctx);
-    ctx->regop_was_repeating = ctx->repeat_measure;
     ctx->regop_retries = 0;
     switch (ctx->regop_pending) {
-    case REGOP_READ:
-        send_regop_read(ctx, ctx->regop_group, LOGGER_REGOP_READ);
-        break;
-    case REGOP_WRITE:
-        send_regop_write(ctx);
-        break;
-    case REGOP_COMMIT:
-        send_regop_commit(ctx);
-        break;
-    case REGOP_DEFAULT:
-        send_regop_default(ctx);
-        break;
-    default:
-        return false;
+    case REGOP_READ:    send_regop_read(ctx, ctx->regop_group, LOGGER_REGOP_READ); break;
+    case REGOP_WRITE:   send_regop_write(ctx); break;
+    case REGOP_COMMIT:  send_regop_commit(ctx); break;
+    case REGOP_DEFAULT: send_regop_default(ctx); break;
+    default: return false;
     }
     return true;
 }
@@ -1569,14 +1803,12 @@ static void regop_complete(logger_ctx_t *ctx)
     ctx->regop_pending = REGOP_NONE;
     ctx->regop_group[0] = ctx->regop_key[0] = ctx->regop_hex[0] = '\0';
     ctx->regop_retries = 0;
-    if (ctx->regop_was_repeating) {
-        ctx->repeat_measure = true;
+    /* After a reg-op, return to whatever the Session was doing. */
+    if (ctx->measure_active && !router_fuota_in_flight()) {
         ctx->state = LOGGER_MEASURE_WAIT;
         start_timeout(ctx, 5);
     } else {
-        router_mark_cooldown(&ctx->address);
-        ctx->state = LOGGER_DISCONNECTING;
-        sl_bt_connection_close(ctx->connection_handle);
+        enter_session_idle(ctx);
     }
 }
 
@@ -1593,9 +1825,6 @@ void router_fuota_drain_chunks(void)
         if (ctx->state != LOGGER_FUOTA_AWAIT_CHUNK) continue;
         if (!ctx->fuota_chunk_ready) continue;
 
-        // The CLI task has written fuota_chunk_data_len bytes of image data
-        // starting at fuota_chunk_buf[OB2PACKET_HEAD_SIZE + 2]. Stamp the
-        // OB2 TYPE, the little-endian seq, then finish the frame.
         uint16_t data_len = ctx->fuota_chunk_data_len;
         ctx->fuota_chunk_buf[1] = ctx->fuota_chunk_type;
         ctx->fuota_chunk_buf[OB2PACKET_HEAD_SIZE + 0] =
@@ -1607,29 +1836,16 @@ void router_fuota_drain_chunks(void)
             ctx->fuota_chunk_buf, pre_crc);
 
         const uint8_t *payload = &ctx->fuota_chunk_buf[OB2PACKET_HEAD_SIZE + 2];
-        uint32_t chunk_crc = crc32_update(0xFFFFFFFFu, payload, data_len)
-                             ^ 0xFFFFFFFFu;
         ctx->fuota_crc32 = crc32_update(ctx->fuota_crc32, payload, data_len);
-        uart_output_log("FUOTA crc seq=%u len=%u chunk=0x%08lX running=0x%08lX",
-                        (unsigned)ctx->fuota_seq,
-                        (unsigned)data_len,
-                        (unsigned long)chunk_crc,
-                        (unsigned long)(ctx->fuota_crc32 ^ 0xFFFFFFFFu));
 
         cancel_timeout(ctx);
         ctx->next_state = LOGGER_FUOTA_CHUNK_SENT;
         ctx->state = LOGGER_WRITE_PENDING;
         ctx->rx_len = 0;
         ctx->fuota_chunk_ready = false;
-        sl_status_t wsc = sl_bt_gatt_write_characteristic_value(
+        (void)sl_bt_gatt_write_characteristic_value(
             ctx->connection_handle, ctx->fuota_char_handle,
             (uint8_t)pkt_len, ctx->fuota_chunk_buf);
-        uart_output_log("FUOTA gatt_write seq=%u pkt_len=%u status=0x%04X",
-                        (unsigned)ctx->fuota_seq,
-                        (unsigned)pkt_len,
-                        (unsigned)wsc);
-        // 10 s matches the spec's note that the logger blocks on flash
-        // before ACKing — well under any real flash-write cadence.
         start_timeout(ctx, 10);
     }
 }

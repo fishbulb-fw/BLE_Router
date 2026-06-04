@@ -36,18 +36,25 @@
 #include <stdbool.h>
 #include "FreeRTOS.h"
 #include "task.h"
+#include "timers.h"
 #include "semphr.h"
 #include "sl_main_init.h"
 #include "app_assert.h"
 #include "app.h"
+#include "hal_wdog.h"
 
 #define APP_TASK_NAME          "app_task"
 #define APP_TASK_STACK_SIZE    512u
 #define APP_TASK_PRIO          24u
 #define APP_MUTEX_WAIT         100 // Timeout to wait for mutex in ticks
 
+// Watchdog feed cadence. WDOG bites at 4 s; feed at 1 s leaves 3 s of slack
+// for the timer task to be momentarily preempted. See ADR 0004.
+#define APP_WDOG_FEED_PERIOD_MS  1000u
+
 // Application task.
 static void app_task(void *p_arg);
+static void app_wdog_feed_timer_cb(TimerHandle_t xTimer);
 
 // Task handle
 static TaskHandle_t      app_task_handle  = NULL;
@@ -55,6 +62,8 @@ static TaskHandle_t      app_task_handle  = NULL;
 static SemaphoreHandle_t app_semaphore_handle = NULL;
 // Mutex handle
 static SemaphoreHandle_t app_mutex_handle = NULL;
+// Watchdog feed timer
+static TimerHandle_t     app_wdog_timer_handle = NULL;
 
 // Application Runtime Init.
 void app_init_bt(void)
@@ -74,6 +83,24 @@ void app_init_bt(void)
   // Create the mutex
   app_mutex_handle = xSemaphoreCreateRecursiveMutex();
   app_assert(app_mutex_handle != NULL, "Mutex creation failed.");
+  // Create + start the watchdog feed timer. hal_wdog_feed() is a no-op until
+  // hal_wdog_start() arms the WDOG, so it is safe to run before then.
+  app_wdog_timer_handle = xTimerCreate("wdog_feed",
+                                       pdMS_TO_TICKS(APP_WDOG_FEED_PERIOD_MS),
+                                       pdTRUE,
+                                       NULL,
+                                       app_wdog_feed_timer_cb);
+  app_assert(app_wdog_timer_handle != NULL, "Watchdog timer creation failed.");
+  (void)xTimerStart(app_wdog_timer_handle, 0);
+}
+
+// FreeRTOS software timer callback — feeds the hardware watchdog every
+// APP_WDOG_FEED_PERIOD_MS. Runs in the FreeRTOS timer task. See ADR 0004
+// for why we feed from a timer rather than the idle hook.
+static void app_wdog_feed_timer_cb(TimerHandle_t xTimer)
+{
+  (void)xTimer;
+  hal_wdog_feed();
 }
 
 /******************************************************************************
