@@ -42,6 +42,9 @@ typedef enum {
     CLI_CMD_WRITEREG,
     CLI_CMD_COMMITREGS,
     CLI_CMD_DEFAULTREGS,
+    CLI_CMD_LGET,
+    CLI_CMD_LSET,
+    CLI_CMD_LCFG_BAD,
     CLI_CMD_UNKNOWN,
     CLI_CMD_BAD_ATM,
     CLI_CMD_BAD_TARGET,
@@ -64,6 +67,8 @@ typedef struct {
     char           regop_group[REGOP_GROUP_MAX];
     char           regop_key[REGOP_KEY_MAX];
     char           regop_hex[REGOP_HEX_MAX];
+    uint16_t       lcfg_type;
+    char           lcfg_value[LCFG_VALUE_BUF];
 } cli_cmd_t;
 
 static TaskHandle_t   cli_task_handle = NULL;
@@ -392,6 +397,51 @@ static void cli_parse(char *line, cli_cmd_t *out)
         out->type = CLI_CMD_DEFAULTREGS;
         return;
     }
+    if (strcmp(tok, "LGET") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        char *typ    = strtok_r(NULL, " \t", &saveptr);
+        if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        if (!serial || !typ) { out->type = CLI_CMD_LCFG_BAD; return; }
+
+        char *end = NULL;
+        long v = strtol(typ, &end, 10);
+        if (end == typ || *end != '\0' || v < 0 || v > 65535) {
+            out->type = CLI_CMD_LCFG_BAD;
+            return;
+        }
+        out->lcfg_type = (uint16_t)v;
+        out->type = CLI_CMD_LGET;
+        return;
+    }
+    if (strcmp(tok, "LSET") == 0) {
+        char *serial = strtok_r(NULL, " \t", &saveptr);
+        char *typ    = strtok_r(NULL, " \t", &saveptr);
+        if (serial) strncpy(out->serial, serial, sizeof(out->serial) - 1);
+        if (!serial || !typ) { out->type = CLI_CMD_LCFG_BAD; return; }
+
+        char *end = NULL;
+        long v = strtol(typ, &end, 10);
+        if (end == typ || *end != '\0' || v < 0 || v > 65535) {
+            out->type = CLI_CMD_LCFG_BAD;
+            return;
+        }
+        out->lcfg_type = (uint16_t)v;
+
+        /* The value is the rest of the line — it may contain spaces inside a
+         * quoted JSON string, so it is NOT tokenised. Spliced verbatim into
+         * {"Type":N,"Value":<value>} by the router. */
+        char *val = saveptr;
+        while (*val == ' ' || *val == '\t') val++;
+        size_t vlen = strlen(val);
+        if (vlen == 0 || vlen >= LCFG_VALUE_BUF) {
+            out->type = CLI_CMD_LCFG_BAD;
+            return;
+        }
+        memcpy(out->lcfg_value, val, vlen);
+        out->lcfg_value[vlen] = '\0';
+        out->type = CLI_CMD_LSET;
+        return;
+    }
     out->type = CLI_CMD_UNKNOWN;
 }
 
@@ -457,6 +507,19 @@ void cli_dispatch_pending(void)
 
         case CLI_CMD_DEFAULTREGS:
             router_admit_defaultregs(cmd.serial);
+            break;
+
+        case CLI_CMD_LGET:
+            router_admit_lget(cmd.serial, cmd.lcfg_type);
+            break;
+
+        case CLI_CMD_LSET:
+            router_admit_lset(cmd.serial, cmd.lcfg_type, cmd.lcfg_value);
+            break;
+
+        case CLI_CMD_LCFG_BAD:
+            uart_output_lcfg_err(cmd.serial[0] ? cmd.serial : "",
+                                 cmd.lcfg_type, REASON_BAD_ARGS);
             break;
 
         case CLI_CMD_BAD_ARGS:

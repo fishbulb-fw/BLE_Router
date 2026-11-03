@@ -32,6 +32,15 @@ static void regop_complete(logger_ctx_t *ctx);
 static void regop_fail(logger_ctx_t *ctx, const char *cmd, const char *reason);
 static const char *regop_cmd_name(regop_kind_t k);
 
+static bool lcfg_type_is_bg_local(uint16_t type);
+static void send_lcfg_request(logger_ctx_t *ctx);
+static bool try_dispatch_lcfg(logger_ctx_t *ctx);
+static void lcfg_complete(logger_ctx_t *ctx);
+static bool try_dispatch_session_op(logger_ctx_t *ctx);
+static void lcfg_normalize_scalar(const char *src, char *out, size_t out_size);
+static bool parse_config_value(const char *json, char *out, size_t out_size);
+static bool config_reply_matches_type(const char *json, uint16_t type);
+
 static void connect_send_next_regs_read(logger_ctx_t *ctx);
 static void enter_session_idle(logger_ctx_t *ctx);
 static void identify_begin(logger_ctx_t *ctx);
@@ -743,7 +752,7 @@ static bool regop_session_ready(const char *cmd, const char *serial,
         uart_output_err(cmd, serial, REASON_NO_SESSION);
         return false;
     }
-    if (ctx->regop_pending != REGOP_NONE) {
+    if (ctx->regop_pending != REGOP_NONE || ctx->lcfg_pending) {
         uart_output_err(cmd, serial, REASON_BAD_ARGS);
         return false;
     }
@@ -801,6 +810,79 @@ void router_admit_defaultregs(const char *serial)
     ctx->regop_retries = 0;
     ctx->regop_group[0] = ctx->regop_key[0] = ctx->regop_hex[0] = '\0';
     (void)try_dispatch_regop(ctx);
+}
+
+/* ============================================================================
+ * Logger-config ops (LGET / LSET)
+ * ============================================================================ */
+
+/* Precondition gate for an LCFG op. Deliberately NOT gated on legacy — the
+ * config channel is live on a legacy Smart, which is the whole point. Failures
+ * surface on the >LCFG err grammar so the Host parses them uniformly. */
+static bool lcfg_session_ready(const char *serial, uint16_t type,
+                               logger_ctx_t **out_ctx)
+{
+    logger_ctx_t *ctx = router_find_by_serial(serial);
+    if (!ctx) {
+        uart_output_lcfg_err(serial, type, REASON_NO_SESSION);
+        return false;
+    }
+    /* Not in a usable idle/measure state → treat as no_session (matches how
+     * reg-ops report connecting/disconnecting/fuota). */
+    if (state_is_fuota(ctx->state) || ctx->fuota_rejoin_pending
+     || ctx->state == LOGGER_CONNECTING
+     || ctx->state == LOGGER_DISCOVER_SERVICE
+     || ctx->state == LOGGER_DISCOVER_CHARS
+     || ctx->state == LOGGER_SUBSCRIBE_CONFIG
+     || ctx->state == LOGGER_SUBSCRIBE_DATA
+     || ctx->state == LOGGER_GET_FW_VERSION
+     || ctx->state == LOGGER_GET_SNS_FW
+     || ctx->state == LOGGER_GET_SNS_SERIAL
+     || ctx->state == LOGGER_GET_PC10_ZERO
+     || ctx->state == LOGGER_GET_PC10_SPAN
+     || ctx->state == LOGGER_PRIME_PRESSURE
+     || ctx->state == LOGGER_CONNECT_REGS
+     || ctx->state == LOGGER_DISCONNECTING) {
+        uart_output_lcfg_err(serial, type, REASON_NO_SESSION);
+        return false;
+    }
+    /* One in-flight config op per Session (shared cursor on the device). */
+    if (ctx->regop_pending != REGOP_NONE || ctx->lcfg_pending) {
+        uart_output_lcfg_err(serial, type, REASON_BAD_ARGS);
+        return false;
+    }
+    *out_ctx = ctx;
+    return true;
+}
+
+void router_admit_lget(const char *serial, uint16_t type)
+{
+    logger_ctx_t *ctx = NULL;
+    if (!lcfg_session_ready(serial, type, &ctx)) return;
+    ctx->lcfg_pending  = true;
+    ctx->lcfg_is_write = false;
+    ctx->lcfg_type     = type;
+    ctx->lcfg_value[0] = '\0';
+    ctx->lcfg_retries  = 0;
+    (void)try_dispatch_lcfg(ctx);
+}
+
+void router_admit_lset(const char *serial, uint16_t type, const char *json_value)
+{
+    logger_ctx_t *ctx = NULL;
+    if (!lcfg_session_ready(serial, type, &ctx)) return;
+    if (!json_value || json_value[0] == '\0'
+     || strlen(json_value) >= LCFG_VALUE_BUF) {
+        uart_output_lcfg_err(serial, type, REASON_BAD_ARGS);
+        return;
+    }
+    ctx->lcfg_pending  = true;
+    ctx->lcfg_is_write = true;
+    ctx->lcfg_type     = type;
+    strncpy(ctx->lcfg_value, json_value, LCFG_VALUE_BUF - 1);
+    ctx->lcfg_value[LCFG_VALUE_BUF - 1] = '\0';
+    ctx->lcfg_retries  = 0;
+    (void)try_dispatch_lcfg(ctx);
 }
 
 /* ============================================================================
@@ -915,6 +997,12 @@ void router_on_disconnected(logger_ctx_t *ctx)
         if (ctx->serial[0]) {
             uart_output_err(cmd, ctx->serial, REASON_BLE_LINK_LOSS);
         }
+    }
+
+    /* Surface an LCFG-in-flight failure. Use reason=ble (within the Host's
+     * LCFG reason set) rather than the >DISCONNECTED-only ble_link_loss. */
+    if (ctx->lcfg_pending && ctx->serial[0]) {
+        uart_output_lcfg_err(ctx->serial, ctx->lcfg_type, REASON_BLE);
     }
 
     if (ctx->serial[0] && ctx->disconnect_reason != NULL) {
@@ -1081,7 +1169,7 @@ static void enter_session_idle(logger_ctx_t *ctx)
 {
     ctx->state = LOGGER_SESSION_IDLE;
     cancel_timeout(ctx);
-    if (try_dispatch_regop(ctx)) return;
+    if (try_dispatch_session_op(ctx)) return;
     if (ctx->measure_active && !router_fuota_in_flight()) {
         measure_kick_or_idle(ctx);
     }
@@ -1093,8 +1181,8 @@ static void measure_kick_or_idle(logger_ctx_t *ctx)
         ctx->state = LOGGER_SESSION_IDLE;
         return;
     }
-    /* Drain any pending reg-op first. */
-    if (try_dispatch_regop(ctx)) return;
+    /* Drain any pending Session op (reg-op or LCFG) first. */
+    if (try_dispatch_session_op(ctx)) return;
 
     router_send_command(ctx, ctx->data_char_handle,
                         "{\"LVC\":21}", LOGGER_TRIGGER_MEASURE);
@@ -1290,7 +1378,7 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         if (ctx->measure_active && !router_fuota_in_flight()) {
             ctx->rx_len = 0;
             ctx->state = LOGGER_MEASURE_WAIT;
-            if (try_dispatch_regop(ctx)) break;
+            if (try_dispatch_session_op(ctx)) break;
             start_timeout(ctx, 5);
         } else {
             enter_session_idle(ctx);
@@ -1464,6 +1552,36 @@ void router_on_notification(logger_ctx_t *ctx, uint16_t characteristic,
         break;
     }
 
+    case LOGGER_LCFG_GET:
+    case LOGGER_LCFG_SET: {
+        /* BG reply > 128 bytes comes back as {"Error":"Too Big"} on the Smart;
+         * surface it rather than hanging to the timeout. */
+        if (strstr(json, "\"Error\":\"Too Big\"") != NULL) {
+            uart_output_lcfg_err(ctx->serial, ctx->lcfg_type, REASON_BAD_SIZE);
+            lcfg_complete(ctx);
+            break;
+        }
+        /* Ignore frames that aren't the reply to our Type (stray telemetry);
+         * keep waiting for ours. */
+        if (!config_reply_matches_type(json, ctx->lcfg_type)) {
+            start_timeout_ms(ctx, 500);
+            break;
+        }
+        char value[LCFG_VALUE_BUF];
+        if (parse_config_value(json, value, sizeof(value))) {
+            uart_output_lcfg(ctx->serial, ctx->lcfg_type, value);
+        } else if (ctx->lcfg_is_write) {
+            /* Device acked the write without echoing Value — confirm with the
+             * value the Host sent, normalized to the value= form. */
+            lcfg_normalize_scalar(ctx->lcfg_value, value, sizeof(value));
+            uart_output_lcfg(ctx->serial, ctx->lcfg_type, value);
+        } else {
+            uart_output_lcfg(ctx->serial, ctx->lcfg_type, "");
+        }
+        lcfg_complete(ctx);
+        break;
+    }
+
     case LOGGER_FUOTA_POST_REBOOT_WAIT: {
         /* DEBUG: dump every non-DBG frame seen during the sensor reboot
          * wait, so we can see exactly what carries the Nack after the
@@ -1514,7 +1632,7 @@ void router_on_timer_expired(logger_ctx_t *ctx)
         return;
     }
     if (ctx->state == LOGGER_MEASURE_WAIT) {
-        if (try_dispatch_regop(ctx)) return;
+        if (try_dispatch_session_op(ctx)) return;
         if (!ctx->measure_active || router_fuota_in_flight()) {
             enter_session_idle(ctx);
             return;
@@ -1539,6 +1657,18 @@ void router_on_timer_expired(logger_ctx_t *ctx)
             }
         } else {
             regop_fail(ctx, regop_cmd_name(ctx->regop_pending), REASON_TIMEOUT);
+        }
+        return;
+    }
+    if (ctx->state == LOGGER_LCFG_GET || ctx->state == LOGGER_LCFG_SET) {
+        if (ctx->lcfg_retries == 0) {
+            ctx->lcfg_retries = 1;
+            send_lcfg_request(ctx);
+        } else {
+            /* No reply within the config window — the Host's "unsupported on
+             * this firmware" signal. */
+            uart_output_lcfg_err(ctx->serial, ctx->lcfg_type, REASON_TIMEOUT);
+            lcfg_complete(ctx);
         }
         return;
     }
@@ -1816,6 +1946,147 @@ static void regop_fail(logger_ctx_t *ctx, const char *cmd, const char *reason)
 {
     uart_output_err(cmd, ctx->serial, reason);
     regop_complete(ctx);
+}
+
+/* ============================================================================
+ * Logger-config (LCFG) senders + reply handling
+ * ============================================================================ */
+
+/* BG-local Types are handled on the config characteristic (bg22_serial);
+ * everything else is forwarded to the PG over the data characteristic
+ * (pg22_serial). See the owner table in docs/CONTEXT.md / the Dash spec. */
+static bool lcfg_type_is_bg_local(uint16_t type)
+{
+    switch (type) {
+    case 10: /* FWBG */
+    case 22: /* SPECIALFUNCTION */
+    case 86: /* ANTENNADETECT */
+    case 87: /* SILICONSERIAL */
+    case 88: /* FUOTAREBOOTSTATUS */
+    case 92: /* BGTIME */
+    case 93: /* PRIMARYSTART */
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Normalize a JSON scalar into the bare >LCFG value= form: a quoted string is
+ * emitted unquoted and verbatim, true→1, false→0, a number passes through. */
+static void lcfg_normalize_scalar(const char *src, char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    while (*src == ' ' || *src == '\t') src++;
+    if (*src == '"') {
+        src++;
+        size_t i = 0;
+        while (src[i] && src[i] != '"' && i + 1 < out_size) {
+            out[i] = src[i];
+            i++;
+        }
+        out[i] = '\0';
+        return;
+    }
+    size_t n = 0;
+    while (src[n] && src[n] != ',' && src[n] != '}'
+        && src[n] != ' ' && src[n] != '\t'
+        && src[n] != '\r' && src[n] != '\n') {
+        n++;
+    }
+    if (n == 4 && strncmp(src, "true", 4) == 0) {
+        strncpy(out, "1", out_size);
+        out[out_size - 1] = '\0';
+        return;
+    }
+    if (n == 5 && strncmp(src, "false", 5) == 0) {
+        strncpy(out, "0", out_size);
+        out[out_size - 1] = '\0';
+        return;
+    }
+    if (n >= out_size) n = out_size - 1;
+    memcpy(out, src, n);
+    out[n] = '\0';
+}
+
+/* Extract and normalize the "Value" field from a config reply. */
+static bool parse_config_value(const char *json, char *out, size_t out_size)
+{
+    const char *v = strstr(json, "\"Value\":");
+    if (!v) return false;
+    v += 8; /* strlen("\"Value\":") */
+    lcfg_normalize_scalar(v, out, out_size);
+    return true;
+}
+
+/* True if the reply carries exactly {"Type":<type>}, not a longer id that
+ * merely starts with the same digits (e.g. 9 must not match 92). */
+static bool config_reply_matches_type(const char *json, uint16_t type)
+{
+    char key[16];
+    int klen = snprintf(key, sizeof(key), "\"Type\":%u", (unsigned)type);
+    if (klen <= 0 || (size_t)klen >= sizeof(key)) return false;
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    char after = p[klen];
+    return !(after >= '0' && after <= '9');
+}
+
+static void send_lcfg_request(logger_ctx_t *ctx)
+{
+    uint16_t handle = lcfg_type_is_bg_local(ctx->lcfg_type)
+                      ? ctx->config_char_handle
+                      : ctx->data_char_handle;
+    char json[32 + LCFG_VALUE_BUF];
+    logger_state_t next;
+
+    if (ctx->lcfg_is_write) {
+        snprintf(json, sizeof(json), "{\"Type\":%u,\"Value\":%s}",
+                 (unsigned)ctx->lcfg_type, ctx->lcfg_value);
+        next = LOGGER_LCFG_SET;
+    } else {
+        snprintf(json, sizeof(json), "{\"Type\":%u}", (unsigned)ctx->lcfg_type);
+        next = LOGGER_LCFG_GET;
+    }
+    router_send_command(ctx, handle, json, next);
+    start_timeout_ms(ctx, 2000);
+}
+
+static bool try_dispatch_lcfg(logger_ctx_t *ctx)
+{
+    if (!ctx->lcfg_pending) return false;
+    /* Safe idle states: SESSION_IDLE, or measure-cycle idle (MEASURE_WAIT). */
+    if (ctx->state != LOGGER_MEASURE_WAIT
+     && ctx->state != LOGGER_SESSION_IDLE) {
+        return false;
+    }
+    cancel_timeout(ctx);
+    ctx->lcfg_retries = 0;
+    send_lcfg_request(ctx);
+    return true;
+}
+
+static void lcfg_complete(logger_ctx_t *ctx)
+{
+    cancel_timeout(ctx);
+    ctx->lcfg_pending  = false;
+    ctx->lcfg_is_write = false;
+    ctx->lcfg_value[0] = '\0';
+    ctx->lcfg_retries  = 0;
+    /* Return to whatever the Session was doing. */
+    if (ctx->measure_active && !router_fuota_in_flight()) {
+        ctx->state = LOGGER_MEASURE_WAIT;
+        start_timeout(ctx, 5);
+    } else {
+        enter_session_idle(ctx);
+    }
+}
+
+/* Dispatch the single pending Session op (reg-op or LCFG), if any. */
+static bool try_dispatch_session_op(logger_ctx_t *ctx)
+{
+    if (try_dispatch_regop(ctx)) return true;
+    if (try_dispatch_lcfg(ctx)) return true;
+    return false;
 }
 
 void router_fuota_drain_chunks(void)

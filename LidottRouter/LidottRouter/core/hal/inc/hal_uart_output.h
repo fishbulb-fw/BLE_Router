@@ -52,4 +52,10 @@ void uart_output_regs_write_ok(const char *serial, const char *group,
                                const char *key);
 void uart_output_regs_op_ok(const char *serial, const char *op);
 
+/* Logger-config (LCFG) read/write result. value= is the rest of the line, so
+ * string values with spaces survive: numbers decimal, booleans 0/1, strings
+ * verbatim without added quotes. */
+void uart_output_lcfg(const char *serial, uint16_t type, const char *value);
+void uart_output_lcfg_err(const char *serial, uint16_t type, const char *reason);
+
 #endif /* HAL_UART_OUTPUT_H */
