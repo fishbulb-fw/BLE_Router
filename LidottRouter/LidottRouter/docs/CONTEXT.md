@@ -69,6 +69,18 @@ Reg-ops dispatch immediately on a Session that has no measure loop running. When
 ### Commit (registers)
 `writereg` stages a register change in the Logger's RAM. `commitregs` tells the Logger to persist the staged changes to flash. `defaultregs` resets the register set to factory defaults.
 
+### Logger Config (LCFG)
+Two Host verbs — `<LGET <serial> <type>` and `<LSET <serial> <type> <json-value>` — read and write *logger-level* device properties: the `{"Type":N}` config namespace (BG/device settings), distinct from the sensor [[Register Editor (Reg-ops)]] register groups. This is a second pass-through channel: the Router OB2-wraps the JSON (`{"Type":N}` to read, `{"Type":N,"Value":v}` to write — no `Dir` field, the Type id *is* the property id), sends it to an open [[Session]], captures the single reply, and emits it as:
+
+- `>LCFG serial=<S> type=<N> value=<V>` — `value=` is the **rest of the line** so string values with spaces survive; numbers decimal, booleans `0`/`1`, strings verbatim without quotes. Emitted for both the GET reply and the SET echo/ack.
+- `>LCFG err serial=<S> type=<N> reason=<enum>` — `reason=timeout` when the Logger does not answer that Type within the config window. **This is the Host's "unsupported on this firmware" signal** (the Host shows the field as unsupported rather than hanging); other reasons: `no_session`, `bad_args`, `ble`, `bad_size`.
+
+`<json-value>` is a ready-typed JSON scalar owned by the Host (it has the field catalog): a number, `true`/`false`, or a `"quoted string"`. The Router splices it in verbatim and does **no range validation** — the Host validates. One in-flight LCFG op per Session, mutually exclusive with reg-ops; it queues behind a running measure loop and dispatches at the next idle window, exactly like a reg-op.
+
+**Routing by owner.** BG-local Types (`10 FWBG, 22 SPECIALFUNCTION, 86 ANTENNADETECT, 87 SILICONSERIAL, 88 FUOTAREBOOTSTATUS, 92 BGTIME, 93 PRIMARYSTART`) go on `config_char_handle`; every other Type is forwarded to the PG on `data_char_handle`. An unhandled Type simply gets no reply → `reason=timeout`.
+
+**Allowed on legacy Sessions.** Unlike calibrate / reg-ops / sync-time, LCFG is *not* gated on a modern Logger — the config channel is live on a legacy Smart (OB2_BG), which is the whole point of the verbs. They do not depend on identify or `BTL:Reg`. See [docs/adr/0009-logger-config-verbs.md](./adr/0009-logger-config-verbs.md).
+
 ### Concurrency Model
 The Router supports up to **8 simultaneously open [[Session]]s**, each with its own state machine. Workflows on different Sessions run in parallel; their `>` events interleave on the UART and the Host demuxes by `serial=`. Per-Session, commands are **serialized**: a `<MEASURE_START` cannot overtake an in-flight reg-op on the same serial — reg-ops are queued to the next idle window in that Logger's measure loop. **At most one pending reg-op per Session.**
 

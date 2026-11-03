@@ -77,6 +77,11 @@ typedef enum {
     LOGGER_REGOP_WRITE,
     LOGGER_REGOP_COMMIT,
     LOGGER_REGOP_DEFAULT,
+    /* --- Logger-config ops (host-driven {"Type":N} read/write, queued behind
+     *     measure loop). Allowed on legacy Sessions — this is the config
+     *     channel both the MSFM4 and the Smart share. --- */
+    LOGGER_LCFG_GET,
+    LOGGER_LCFG_SET,
     LOGGER_DISCONNECTING,
 } logger_state_t;
 
@@ -92,6 +97,7 @@ typedef enum {
 #define REGOP_KEY_BUF    24
 #define REGOP_HEX_BUF    64
 #define REGOP_BLOB_BUF   513
+#define LCFG_VALUE_BUF   64
 
 typedef enum {
     LOGGER_MODE_MEASURE = 0,
@@ -176,6 +182,15 @@ typedef struct {
     char           regop_key[REGOP_KEY_BUF];
     char           regop_hex[REGOP_HEX_BUF];
     uint8_t        regop_retries;
+
+    /* Logger-config op (LGET/LSET). One in-flight per Session, mutually
+     * exclusive with reg-ops. lcfg_value holds the ready-typed JSON scalar
+     * for a write (spliced verbatim into {"Type":N,"Value":<v>}). */
+    bool           lcfg_pending;
+    bool           lcfg_is_write;
+    uint16_t       lcfg_type;
+    char           lcfg_value[LCFG_VALUE_BUF];
+    uint8_t        lcfg_retries;
 } logger_ctx_t;
 
 /* ---- Lifecycle / lookup ---- */
@@ -235,6 +250,13 @@ void router_admit_writereg(const char *serial, const char *group,
                            const char *key, const char *hex_val);
 void router_admit_commitregs(const char *serial);
 void router_admit_defaultregs(const char *serial);
+
+/* Logger-config ops. Read/write a logger-level {"Type":N} property over the
+ * config channel both loggers share. Valid against any open Session INCLUDING
+ * a legacy one; queue if a measure loop is running. json_value is the Host's
+ * ready-typed JSON scalar, spliced verbatim into the write. */
+void router_admit_lget(const char *serial, uint16_t type);
+void router_admit_lset(const char *serial, uint16_t type, const char *json_value);
 
 /* ---- FUOTA chunk plumbing (CLI <-> BT thread) ---- */
 uint16_t router_fuota_next_expected_bytes(logger_ctx_t **out_ctx);

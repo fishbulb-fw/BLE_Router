@@ -229,3 +229,27 @@ void uart_output_regs_op_ok(const char *serial, const char *op)
     (void)serial; (void)op;
 #endif
 }
+
+void uart_output_lcfg(const char *serial, uint16_t type, const char *value)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">LCFG serial=%s type=%u value=%s\r\n",
+           serial ? serial : "",
+           (unsigned)type,
+           value ? value : "");
+#else
+    (void)serial; (void)type; (void)value;
+#endif
+}
+
+void uart_output_lcfg_err(const char *serial, uint16_t type, const char *reason)
+{
+#if UART_OUTPUT_ENABLED
+    printf(">LCFG err serial=%s type=%u reason=%s\r\n",
+           serial ? serial : "",
+           (unsigned)type,
+           reason ? reason : "unknown");
+#else
+    (void)serial; (void)type; (void)reason;
+#endif
+}
